@@ -1403,38 +1403,47 @@ def boundary_cut_tab() -> None:
 
 def alignment_tab() -> None:
     st.subheader("Alignment")
-    st.caption("Load EBSD/DIC transformation metadata and EBSD ANG data for the next alignment-processing steps.")
+    st.caption(
+        "Load EBSD/DIC transformation metadata and EBSD ANG data by local file path. "
+        "Path-based loading avoids Streamlit upload size limits for large ANG and CSV files."
+    )
 
     col1, col2 = st.columns(2)
+    st.session_state.setdefault("alignment_transform_json_path", "")
+    st.session_state.setdefault("alignment_ang_path", "")
+    st.session_state.setdefault("alignment_transform_json_path_input", st.session_state["alignment_transform_json_path"])
+    st.session_state.setdefault("alignment_ang_path_input", st.session_state["alignment_ang_path"])
     with col1:
-        transform_file = st.file_uploader(
-            "Transformation JSON",
-            type=["json"],
-            key="alignment_transform_json_file",
-            help="JSON saved from the DIC/EBSD alignment tool. It should contain control points and transform coefficients.",
+        st.text_input(
+            "Transformation JSON path",
+            key="alignment_transform_json_path_input",
+            placeholder="/path/to/alignment_transformation.json",
+            help="JSON saved from the DIC/EBSD alignment tool. Paste the local path.",
         )
     with col2:
-        ang_file = st.file_uploader(
-            "ANG file",
-            type=["ang", "txt"],
-            key="alignment_ang_file",
-            help="EBSD orientation data file in .ang format.",
+        st.text_input(
+            "ANG file path",
+            key="alignment_ang_path_input",
+            placeholder="/path/to/orientation_data.ang",
+            help="EBSD orientation data file in .ang format. Paste the local path.",
         )
+    st.session_state["alignment_transform_json_path"] = str(
+        Path(str(st.session_state.get("alignment_transform_json_path_input", "")).strip()).expanduser()
+    ) if str(st.session_state.get("alignment_transform_json_path_input", "")).strip() else ""
+    st.session_state["alignment_ang_path"] = str(
+        Path(str(st.session_state.get("alignment_ang_path_input", "")).strip()).expanduser()
+    ) if str(st.session_state.get("alignment_ang_path_input", "")).strip() else ""
 
     if st.button("Use default alignment files", key="alignment_use_default_files"):
         st.session_state["alignment_transform_json_path"] = str(DEFAULT_ALIGNMENT_TRANSFORM_JSON)
         st.session_state["alignment_ang_path"] = str(DEFAULT_ANG_FILE)
+        st.session_state["alignment_transform_json_path_input"] = str(DEFAULT_ALIGNMENT_TRANSFORM_JSON)
+        st.session_state["alignment_ang_path_input"] = str(DEFAULT_ANG_FILE)
         st.session_state["alignment_events_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
         st.session_state["alignment_event_pixels_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-
-    if transform_file is not None:
-        st.session_state["alignment_transform_json_path"] = str(
-            save_uploaded_streamlit_file(transform_file, "alignment")
-        )
-    if ang_file is not None:
-        st.session_state["alignment_ang_path"] = str(
-            save_uploaded_streamlit_file(ang_file, "alignment")
-        )
+        st.session_state["alignment_events_file_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
+        st.session_state["alignment_event_pixels_file_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
+        st.rerun()
 
     transform_path = st.session_state.get("alignment_transform_json_path", "")
     ang_path = st.session_state.get("alignment_ang_path", "")
@@ -1698,33 +1707,37 @@ def alignment_tab() -> None:
 
     st.markdown("**EBSD-Cut Events**")
     event_col1, event_col2 = st.columns(2)
+    st.session_state.setdefault("alignment_events_path", "")
+    st.session_state.setdefault("alignment_event_pixels_path", "")
+    st.session_state.setdefault("alignment_events_path_input", st.session_state["alignment_events_path"])
+    st.session_state.setdefault("alignment_event_pixels_path_input", st.session_state["alignment_event_pixels_path"])
     with event_col1:
-        events_file = st.file_uploader(
-            "Events CSV after EBSD cut",
-            type=["csv"],
-            key="alignment_events_file",
-            help="Post-cut event-level CSV, usually saved from Boundary Cut.",
+        st.text_input(
+            "Events CSV path after EBSD cut",
+            key="alignment_events_path_input",
+            placeholder="/path/to/boundary_cut_events.csv",
+            help="Post-cut event-level CSV, usually saved from Boundary Cut. Paste the local path.",
         )
     with event_col2:
-        event_pixels_file = st.file_uploader(
-            "Event pixels CSV after EBSD cut",
-            type=["csv"],
-            key="alignment_event_pixels_file",
-            help="Post-cut event pixel CSV with event_id, pixel_x, pixel_y.",
+        st.text_input(
+            "Event pixels CSV path after EBSD cut",
+            key="alignment_event_pixels_path_input",
+            placeholder="/path/to/boundary_cut_event_pixels.csv",
+            help="Post-cut event pixel CSV with event_id, pixel_x, pixel_y. Paste the local path.",
         )
+    st.session_state["alignment_events_path"] = str(
+        Path(str(st.session_state.get("alignment_events_path_input", "")).strip()).expanduser()
+    ) if str(st.session_state.get("alignment_events_path_input", "")).strip() else ""
+    st.session_state["alignment_event_pixels_path"] = str(
+        Path(str(st.session_state.get("alignment_event_pixels_path_input", "")).strip()).expanduser()
+    ) if str(st.session_state.get("alignment_event_pixels_path_input", "")).strip() else ""
 
     if st.button("Use default EBSD-cut event files", key="alignment_use_default_event_files"):
         st.session_state["alignment_events_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
         st.session_state["alignment_event_pixels_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-
-    if events_file is not None:
-        st.session_state["alignment_events_path"] = str(
-            save_uploaded_streamlit_file(events_file, "alignment_events")
-        )
-    if event_pixels_file is not None:
-        st.session_state["alignment_event_pixels_path"] = str(
-            save_uploaded_streamlit_file(event_pixels_file, "alignment_events")
-        )
+        st.session_state["alignment_events_path_input"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
+        st.session_state["alignment_event_pixels_path_input"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
+        st.rerun()
 
     events_path = st.session_state.get("alignment_events_path", "")
     event_pixels_path = st.session_state.get("alignment_event_pixels_path", "")
