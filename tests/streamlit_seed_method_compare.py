@@ -4224,8 +4224,33 @@ def draw_mask_overlay(rgb: np.ndarray, mask: np.ndarray, color: tuple[int, int, 
 
 
 def sidebar_params() -> PipelineParams:
-    image_path = st.sidebar.text_input("BLN detection image path", str(DEFAULT_IMAGE))
-    grx_overlay_path = st.sidebar.text_input("GRX overlay image path", str(DEFAULT_GRX_IMAGE))
+    st.sidebar.markdown("**Input Images**")
+    st.sidebar.caption(
+        "Paste local image paths from this machine. Streamlit browsers cannot return a local file path "
+        "from a file-picker without uploading the file."
+    )
+    if st.sidebar.button("Use project default image paths", key="sidebar_use_default_image_paths"):
+        st.session_state["sidebar_bln_detection_image_path"] = str(DEFAULT_IMAGE)
+        st.session_state["sidebar_grx_overlay_image_path"] = str(DEFAULT_GRX_IMAGE)
+        st.rerun()
+    st.session_state.setdefault("sidebar_bln_detection_image_path", "")
+    st.session_state.setdefault("sidebar_grx_overlay_image_path", "")
+
+    image_path = st.sidebar.text_input(
+        "BLN detection image path",
+        key="sidebar_bln_detection_image_path",
+        placeholder="/path/to/Fused_BlN_step3.tif",
+        help="Required. Paste the local path to the BLN/DIC image used for detection.",
+    )
+    grx_overlay_path = st.sidebar.text_input(
+        "GRX overlay image path",
+        key="sidebar_grx_overlay_image_path",
+        placeholder="/path/to/Fused_GrX_step3_3pxGB_8bit.tif",
+        help="Optional. Paste the local path to the GRX image used for overlays.",
+    )
+    if not image_path.strip():
+        st.sidebar.info("Enter a BLN detection image path to start.")
+        st.stop()
     image_path = str(Path(image_path).expanduser())
     grx_overlay_path = str(Path(grx_overlay_path).expanduser()) if grx_overlay_path.strip() else ""
     if not Path(image_path).exists():
