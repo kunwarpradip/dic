@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .wrap {
+      border: 1px solid #d8dee9;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #101418;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      color: #eef2f5;
+      background: #1d252d;
+      font-size: 13px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    button {
+      border: 1px solid #56616e;
+      border-radius: 6px;
+      padding: 5px 9px;
+      background: #2b3540;
+      color: #eef2f5;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    button:hover {
+      background: #344150;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      cursor: crosshair;
+      background: #050607;
+      user-select: none;
+    }
+
+    .readout {
+      padding: 7px 10px;
+      background: #1d252d;
+      color: #c9d1d9;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap" class="wrap">
+    <div class="toolbar">
+      <span>Drag on the image to select the processing crop.</span>
+      <div class="actions">
+        <button id="use" type="button">Use Selection</button>
+        <button id="reset" type="button">Reset</button>
+      </div>
+    </div>
+    <canvas id="canvas"></canvas>
+    <div id="readout" class="readout">x: -, y: -, width: -, height: -</div>
+  </div>
+
+  <script>
+    const wrap = document.getElementById("wrap");
+    const canvas = document.getElementById("canvas");
+    const readout = document.getElementById("readout");
+    const useButton = document.getElementById("use");
+    const resetButton = document.getElementById("reset");
+    const ctx = canvas.getContext("2d");
+    const img = new Image();
+    const dpr = window.devicePixelRatio || 1;
+
+    let args = {};
+    let selection = { x: 0, y: 0, width: 500, height: 500 };
+    let dragging = false;
+    let startOriginal = null;
+    let canvasCssWidth = 320;
+    let canvasCssHeight = 240;
+    let previewScale = 1;
+
+    function post(type, data) {
+      window.parent.postMessage(
+        {
+          isStreamlitMessage: true,
+          type,
+          ...data,
+        },
+        "*"
+      );
+    }
+
+    function setReady() {
+      post("streamlit:componentReady", { apiVersion: 1 });
+    }
+
+    function setFrameHeight() {
+      post("streamlit:setFrameHeight", {
+        height: Math.ceil(document.documentElement.scrollHeight),
+      });
+    }
+
+    function setValue(value) {
+      post("streamlit:setComponentValue", { value });
+    }
+
+    function clampSelection(rect) {
+      const minSize = args.min_crop_size || 20;
+      const viewX = args.view_x || 0;
+      const viewY = args.view_y || 0;
+      const viewWidth = args.view_width || args.original_width;
+      const viewHeight = args.view_height || args.original_height;
+      let width = Math.max(minSize, Math.round(rect.width));
+      let height = Math.max(minSize, Math.round(rect.height));
+      width = Math.min(width, viewWidth);
+      height = Math.min(height, viewHeight);
+
+      let x = Math.round(rect.x);
+      let y = Math.round(rect.y);
+      x = Math.max(viewX, Math.min(x, viewX + viewWidth - width));
+      y = Math.max(viewY, Math.min(y, viewY + viewHeight - height));
+      return { x, y, width, height };
+    }
+
+    function centerDefaultCrop() {
+      const viewX = args.view_x || 0;
+      const viewY = args.view_y || 0;
+      const viewWidth = args.view_width || args.original_width;
+      const viewHeight = args.view_height || args.original_height;
+      const width = Math.min(args.default_crop_width || 500, viewWidth);
+      const height = Math.min(args.default_crop_height || 500, viewHeight);
+      return {
+        x: viewX + Math.round((viewWidth - width) / 2),
+        y: viewY + Math.round((viewHeight - height) / 2),
+        width,
+        height,
+      };
+    }
+
+    function originalToCanvasX(x) {
+      const viewX = args.view_x || 0;
+      const viewWidth = args.view_width || args.original_width;
+      return ((x - viewX) / viewWidth) * args.preview_width * previewScale;
+    }
+
+    function originalToCanvasY(y) {
+      const viewY = args.view_y || 0;
+      const viewHeight = args.view_height || args.original_height;
+      return ((y - viewY) / viewHeight) * args.preview_height * previewScale;
+    }
+
+    function canvasToOriginal(point) {
+      const viewX = args.view_x || 0;
+      const viewY = args.view_y || 0;
+      const viewWidth = args.view_width || args.original_width;
+      const viewHeight = args.view_height || args.original_height;
+      const previewX = point.x / previewScale;
+      const previewY = point.y / previewScale;
+      return {
+        x: Math.max(viewX, Math.min(viewX + viewWidth, viewX + (previewX / args.preview_width) * viewWidth)),
+        y: Math.max(viewY, Math.min(viewY + viewHeight, viewY + (previewY / args.preview_height) * viewHeight)),
+      };
+    }
+
+    function pointerPoint(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+      };
+    }
+
+    function resizeCanvas() {
+      const availableWidth = Math.max(320, wrap.clientWidth || 320);
+      canvasCssWidth = Math.min(args.preview_width || availableWidth, availableWidth);
+      canvasCssHeight = Math.round(canvasCssWidth * (args.preview_height / args.preview_width));
+      previewScale = canvasCssWidth / args.preview_width;
+
+      canvas.style.width = canvasCssWidth + "px";
+      canvas.style.height = canvasCssHeight + "px";
+      canvas.width = Math.round(canvasCssWidth * dpr);
+      canvas.height = Math.round(canvasCssHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      draw();
+      setFrameHeight();
+    }
+
+    function draw() {
+      if (!img.complete || !args.preview_width) {
+        return;
+      }
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, canvasCssWidth, canvasCssHeight);
+      ctx.fillStyle = "#050607";
+      ctx.fillRect(0, 0, canvasCssWidth, canvasCssHeight);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(img, 0, 0, canvasCssWidth, canvasCssHeight);
+
+      const x = originalToCanvasX(selection.x);
+      const y = originalToCanvasY(selection.y);
+      const width = originalToCanvasX(selection.x + selection.width) - x;
+      const height = originalToCanvasY(selection.y + selection.height) - y;
+
+      ctx.save();
+      ctx.fillStyle = "rgba(255, 230, 80, 0.18)";
+      ctx.strokeStyle = "rgba(255, 230, 80, 0.95)";
+      ctx.lineWidth = 2;
+      ctx.fillRect(x, y, width, height);
+      ctx.strokeRect(x, y, width, height);
+      ctx.restore();
+
+      readout.textContent =
+        "x: " +
+        selection.x +
+        ", y: " +
+        selection.y +
+        ", width: " +
+        selection.width +
+        ", height: " +
+        selection.height;
+    }
+
+    function updateSelectionFromPointer(event) {
+      const current = canvasToOriginal(pointerPoint(event));
+      const x0 = Math.min(startOriginal.x, current.x);
+      const y0 = Math.min(startOriginal.y, current.y);
+      const x1 = Math.max(startOriginal.x, current.x);
+      const y1 = Math.max(startOriginal.y, current.y);
+      selection = clampSelection({
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+      });
+      draw();
+    }
+
+    canvas.addEventListener("mousedown", (event) => {
+      dragging = true;
+      startOriginal = canvasToOriginal(pointerPoint(event));
+      updateSelectionFromPointer(event);
+    });
+
+    canvas.addEventListener("mousemove", (event) => {
+      if (dragging) {
+        updateSelectionFromPointer(event);
+      }
+    });
+
+    window.addEventListener("mouseup", (event) => {
+      if (!dragging) {
+        return;
+      }
+      dragging = false;
+      updateSelectionFromPointer(event);
+      setValue(selection);
+    });
+
+    useButton.addEventListener("click", () => {
+      setValue(selection);
+    });
+
+    resetButton.addEventListener("click", () => {
+      selection = clampSelection(centerDefaultCrop());
+      draw();
+      setValue(selection);
+    });
+
+    window.addEventListener("resize", resizeCanvas);
+
+    window.addEventListener("message", (event) => {
+      if (event.data.type !== "streamlit:render") {
+        return;
+      }
+
+      args = event.data.args || {};
+      selection = clampSelection(args.initial_crop || centerDefaultCrop());
+      img.onload = resizeCanvas;
+      img.src = args.image_data_url;
+      if (img.complete) {
+        resizeCanvas();
+      }
+    });
+
+    setReady();
+  </script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+name: dicqt
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pillow
+  - pyside6
+  - scipy
+  - scikit-image
+  - streamlit

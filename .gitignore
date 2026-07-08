@@ -1,0 +1,13 @@
+DIC_event_detection_Minh
+*pycache*
+tests/*.ipynb
+tests/outputs
+Tools
+z_share*
+DIC_JAVA_TOOL_FEATURE_INVENTORY.md
+DIC_check_slip_traces_only_basal_prism.py
+check_traces.py
+*.png
+*.ang
+*.bmp
+.DS_Store
