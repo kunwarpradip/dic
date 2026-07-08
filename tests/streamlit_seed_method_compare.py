@@ -280,22 +280,32 @@ def main() -> None:
 
             if auto_run_hough or hough_detect_clicked:
                 label = "full-image" if params.use_full_image else "crop-based"
-                with st.spinner(f"Running {label} Hough line/seed detection..."):
-                    stored_result = run_hough_seed_pipeline(params)
-                    st.session_state["last_pipeline_params"] = params
-                    st.session_state["last_pipeline_result"] = stored_result
-                    stored_params = params
+                with hough_step1_result_area:
+                    stored_result = run_hough_seed_pipeline_with_progress(
+                        params,
+                        label=f"Running {label} Hough line/seed detection",
+                    )
+                st.session_state["last_pipeline_params"] = params
+                st.session_state["last_pipeline_result"] = stored_result
+                stored_params = params
 
             if hough_trace_clicked:
                 label = "full-image" if params.use_full_image else "crop-based"
                 if stored_result is None or "hough" not in stored_result:
-                    with st.spinner(f"Running {label} Hough line/seed detection first..."):
-                        stored_result = run_hough_seed_pipeline(params)
-                with st.spinner("Tracing events from selected Hough seeds..."):
-                    stored_result = trace_hough_events_for_result(stored_result, params)
-                    st.session_state["last_pipeline_params"] = params
-                    st.session_state["last_pipeline_result"] = stored_result
-                    stored_params = params
+                    with hough_step1_result_area:
+                        stored_result = run_hough_seed_pipeline_with_progress(
+                            params,
+                            label=f"Running {label} Hough line/seed detection first",
+                        )
+                with hough_step2_result_area:
+                    stored_result = trace_hough_events_for_result_with_progress(
+                        stored_result,
+                        params,
+                        label="Tracing events from selected Hough seeds",
+                    )
+                st.session_state["last_pipeline_params"] = params
+                st.session_state["last_pipeline_result"] = stored_result
+                stored_params = params
 
             with hough_step1_result_area:
                 if stored_result is None or "hough" not in stored_result:
@@ -357,7 +367,7 @@ def main() -> None:
         boundary_cut_tab()
 
     with tab_alignment:
-        alignment_tab()
+        alignment_tab(params)
 
     with tab_event_analysis:
         event_analysis_tab()
@@ -597,6 +607,183 @@ def ordered_crystal_mode_selector(crystal_structure: str) -> list[str]:
             st.rerun()
 
     return ordered_selected
+
+
+def slip_trace_summary_frame(
+    trace_data: pd.DataFrame,
+    crystal_config: dict | None,
+    coordinate_source: str,
+) -> pd.DataFrame:
+    prism_shape = matrix_shape_label(trace_data["prism"].iloc[0]) if len(trace_data) and "prism" in trace_data else ""
+    basal_shape = matrix_shape_label(trace_data["basal"].iloc[0]) if len(trace_data) and "basal" in trace_data else ""
+    preview_rows = [
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Trace rows",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": f"{len(trace_data):,}",
+        },
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Coordinate source",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": coordinate_source,
+        },
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Preview systems",
+            "trace_vectors": "4",
+            "kind": "basal/prismatic preview",
+            "angle_tolerance_deg": "",
+            "value": "3 prismatic + 1 basal",
+        },
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Angle units",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": "radians",
+        },
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Prism shape",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": prism_shape,
+        },
+        {
+            "section": "Generated preview",
+            "priority": "",
+            "item": "Basal shape",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": basal_shape,
+        },
+    ]
+
+    crystal_rows = crystal_mode_summary_frame(crystal_config).rename(columns={"mode": "item"})
+    crystal_rows.insert(0, "section", "Scoring configuration")
+    return pd.concat([pd.DataFrame(preview_rows), crystal_rows], ignore_index=True)
+
+
+def show_compact_slip_trace_summary(
+    trace_data: pd.DataFrame,
+    crystal_config: dict | None,
+    coordinate_source: str,
+) -> None:
+    config = normalized_crystal_config(crystal_config, fallback_angle_tolerance=5.0)
+    active_modes = list(config["active_modes"])
+    total_selected_vectors = sum(CRYSTAL_MODE_TRACE_COUNTS.get(mode, 0) for mode in active_modes)
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Generated preview rows", f"{len(trace_data):,}")
+    metric_cols[1].metric("Preview vectors/row", "4")
+    metric_cols[2].metric("Selected scoring vectors", f"{total_selected_vectors:,}")
+    metric_cols[3].metric("Coordinate source", coordinate_source)
+
+    if not active_modes:
+        st.warning("No crystal modes are selected for scoring.")
+        return
+
+    st.caption(
+        f"Scoring configuration: {config['crystal_structure']} | "
+        f"{config['ebsd_convention']} reference frame | "
+        f"slip tolerance {config['slip_tolerance']:.3f} deg"
+        + (
+            f" | twin tolerance {config['twin_tolerance']:.3f} deg"
+            if config["crystal_structure"].startswith("HCP")
+            else ""
+        )
+    )
+    priority_text = "\n".join(
+        (
+            f"{index}. {mode} "
+            f"({CRYSTAL_MODE_TRACE_COUNTS.get(mode, 0)} vectors, "
+            f"{'twin' if 'Twin' in mode else 'slip'})"
+        )
+        for index, mode in enumerate(active_modes, start=1)
+    )
+    st.code(priority_text, language="text")
+
+
+def crystal_mode_summary_frame(crystal_config: dict | None) -> pd.DataFrame:
+    config = normalized_crystal_config(crystal_config, fallback_angle_tolerance=5.0)
+    rows = [
+        {
+            "priority": "",
+            "mode": "Crystal structure",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": config["crystal_structure"],
+        },
+        {
+            "priority": "",
+            "mode": "EBSD reference frame",
+            "trace_vectors": "",
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": config["ebsd_convention"],
+        },
+    ]
+    if config["crystal_structure"].startswith("HCP"):
+        rows.extend(
+            [
+                {
+                    "priority": "",
+                    "mode": "<a> lattice parameter",
+                    "trace_vectors": "",
+                    "kind": "",
+                    "angle_tolerance_deg": "",
+                    "value": f"{config['hcp_lattice_a']:.6f}",
+                },
+                {
+                    "priority": "",
+                    "mode": "<c> lattice parameter",
+                    "trace_vectors": "",
+                    "kind": "",
+                    "angle_tolerance_deg": "",
+                    "value": f"{config['hcp_lattice_c']:.6f}",
+                },
+            ]
+        )
+
+    for index, mode in enumerate(config["active_modes"], start=1):
+        kind = "twin" if "Twin" in mode else "slip"
+        tolerance = config["twin_tolerance"] if kind == "twin" else config["slip_tolerance"]
+        rows.append(
+            {
+                "priority": index,
+                "mode": mode,
+                "trace_vectors": CRYSTAL_MODE_TRACE_COUNTS.get(mode, 0),
+                "kind": kind,
+                "angle_tolerance_deg": f"{tolerance:.3f}",
+                "value": "",
+            }
+        )
+
+    rows.append(
+        {
+            "priority": "",
+            "mode": "Total selected trace vectors",
+            "trace_vectors": sum(CRYSTAL_MODE_TRACE_COUNTS.get(mode, 0) for mode in config["active_modes"]),
+            "kind": "",
+            "angle_tolerance_deg": "",
+            "value": "",
+        }
+    )
+    return pd.DataFrame(rows)
 
 
 def ebsd_cuts_tab(params: PipelineParams) -> None:
@@ -1401,7 +1588,7 @@ def boundary_cut_tab() -> None:
         check_boundary_cut_events_tab()
 
 
-def alignment_tab() -> None:
+def alignment_tab(params: PipelineParams | None = None) -> None:
     st.subheader("Alignment")
     st.caption(
         "Load EBSD/DIC transformation metadata and EBSD ANG data by local file path. "
@@ -1441,18 +1628,42 @@ def alignment_tab() -> None:
         st.session_state["alignment_ang_path_input"] = str(DEFAULT_ANG_FILE)
         st.session_state["alignment_events_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
         st.session_state["alignment_event_pixels_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-        st.session_state["alignment_events_file_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
-        st.session_state["alignment_event_pixels_file_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
+        st.session_state["alignment_events_path_input"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
+        st.session_state["alignment_event_pixels_path_input"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
         st.rerun()
 
     transform_path = st.session_state.get("alignment_transform_json_path", "")
     ang_path = st.session_state.get("alignment_ang_path", "")
+    sidebar_bln_path = params.image_path if params is not None else ""
+    if (
+        sidebar_bln_path
+        and not str(st.session_state.get("alignment_bln_background_path_input", "")).strip()
+    ):
+        st.session_state["alignment_bln_background_path_input"] = sidebar_bln_path
+    alignment_bln_background_path = st.text_input(
+        "BLN background image path for Alignment overlays",
+        key="alignment_bln_background_path_input",
+        placeholder="/path/to/Fused_BlN_step3.tif",
+        help=(
+            "Used as the background for event-shape and event-scoring overlays. "
+            "Defaults to the BLN image path from the sidebar, but can be changed here."
+        ),
+    )
+    alignment_bln_background_path = (
+        str(Path(str(alignment_bln_background_path).strip()).expanduser())
+        if str(alignment_bln_background_path).strip()
+        else ""
+    )
+    if alignment_bln_background_path and not Path(alignment_bln_background_path).exists():
+        st.warning(f"Alignment BLN background image not found: {alignment_bln_background_path}")
 
     loaded = []
     if transform_path:
         loaded.append(f"transformation JSON: `{Path(transform_path).name}`")
     if ang_path:
         loaded.append(f"ANG: `{Path(ang_path).name}`")
+    if alignment_bln_background_path:
+        loaded.append(f"BLN overlay background: `{Path(alignment_bln_background_path).name}`")
     if loaded:
         st.caption("Loaded " + " | ".join(loaded))
     else:
@@ -1651,16 +1862,16 @@ def alignment_tab() -> None:
             "When the transform is loaded, only coordinates are expressed on the DIC canvas; Euler angles and trace directions are not transformed."
         )
         st.caption(f"Current ANG coordinate source: `{alignment_coordinate_source}`")
-        if st.button("Generate slip trace vectors", key="alignment_generate_slip_traces"):
-            st.session_state["alignment_slip_trace_source"] = ang_path
-            st.session_state["alignment_slip_trace_coordinate_source"] = alignment_coordinate_source
-
-        if st.session_state.get("alignment_slip_trace_source") == ang_path:
-            selected_trace_source = st.session_state.get(
-                "alignment_slip_trace_coordinate_source",
-                alignment_coordinate_source,
-            )
+        trace_signature = (
+            str(ang_path),
+            file_cache_signature(ang_path),
+            alignment_coordinate_source,
+            file_cache_signature(transform_path) if transform_path and Path(transform_path).exists() else None,
+        )
+        generate_trace_preview = st.button("Generate slip trace vectors", key="alignment_generate_slip_traces")
+        if generate_trace_preview:
             try:
+                selected_trace_source = alignment_coordinate_source
                 if transform is not None and dic_coords is not None:
                     if selected_trace_source == "Filled full-DIC canvas":
                         st.info(
@@ -1668,37 +1879,48 @@ def alignment_tab() -> None:
                             "transformed ANG measurement rows; the filled canvas will be used for DIC/event-pixel lookup "
                             "without creating a huge full-pixel dataframe."
                         )
-                    with st.spinner("Generating basal/prismatic preview trace vectors for transformed ANG rows..."):
-                        trace_data = build_dic_space_trace_vector_data(
-                            dic_coords,
-                            transform["forward_params"],
-                            schema_version=2,
-                        )
+                    trace_data = build_dic_space_trace_vector_data_with_progress(
+                        dic_coords,
+                        transform["forward_params"],
+                        label="Generating basal/prismatic preview trace vectors",
+                        schema_version=2,
+                    )
                 elif transform is not None:
                     st.error("Transform is loaded, but DIC-space ANG coordinates are not available yet.")
                     return
                 else:
-                    with st.spinner("Generating EBSD-space basal/prismatic preview trace vectors for ANG rows..."):
-                        trace_data = load_ang_trace_vector_data(ang_path, schema_version=3)
+                    trace_data = load_ang_trace_vector_data_with_progress(
+                        ang_path,
+                        label="Generating EBSD-space basal/prismatic preview trace vectors",
+                        schema_version=3,
+                    )
             except Exception as exc:
                 st.error(f"Could not generate slip trace vectors: {exc}")
                 return
+            else:
+                st.session_state["alignment_slip_trace_data"] = trace_data
+                st.session_state["alignment_slip_trace_signature"] = trace_signature
 
-            trace_cols = st.columns(4)
-            trace_cols[0].metric("Trace rows", f"{len(trace_data):,}")
-            trace_cols[1].metric("Prism systems", "3")
-            trace_cols[2].metric("Basal systems", "1")
-            trace_cols[3].metric("Angle units", "radians")
-            if len(trace_data):
-                shape_cols = st.columns(2)
-                shape_cols[0].metric("Prism shape", matrix_shape_label(trace_data["prism"].iloc[0]))
-                shape_cols[1].metric("Basal shape", matrix_shape_label(trace_data["basal"].iloc[0]))
+        trace_data = st.session_state.get("alignment_slip_trace_data")
+        if trace_data is not None:
+            if st.session_state.get("alignment_slip_trace_signature") != trace_signature:
+                st.info("Slip trace preview is stale for the current ANG/transform/source. Press Generate slip trace vectors to refresh it.")
+                trace_data = None
+
+        if trace_data is not None:
+            st.markdown("**Slip Trace Summary**")
+            show_compact_slip_trace_summary(
+                trace_data,
+                st.session_state.get("crystal_setup_config"),
+                alignment_coordinate_source,
+            )
+            st.markdown("**Sanity Check Preview**")
             st.caption(
-                "`prism` stores a 3x3 trace-vector matrix. `basal` stores a 1x3 trace-vector matrix. "
-                "The coordinates may be transformed into DIC space, but the trace vectors are generated directly from unchanged Euler angles."
+                "Small preview of generated basal/prismatic trace vectors. "
+                "Event scoring uses the selected Crystal Setup modes shown in the summary above."
             )
             st.dataframe(
-                display_trace_vector_table(trace_data.head(100)),
+                display_trace_vector_table(trace_data.head(10)),
                 width="stretch",
                 hide_index=True,
             )
@@ -1893,7 +2115,11 @@ def alignment_tab() -> None:
             key="alignment_shape_overlay_max_dim",
             help="Maximum width or height used for event-shape overlay previews. Lower values load faster and use less memory.",
         )
-        morphology_bln_path = infer_event_image_path_from_frame(event_info["events"]) or str(DEFAULT_IMAGE)
+        morphology_bln_path = (
+            alignment_bln_background_path
+            or infer_event_image_path_from_frame(event_info["events"])
+            or str(DEFAULT_IMAGE)
+        )
         if not Path(morphology_bln_path).exists():
             st.warning(f"BLN image not found for overlays: {morphology_bln_path}")
         else:
@@ -2191,7 +2417,11 @@ def alignment_tab() -> None:
                 key="alignment_score_overlay_max_dim",
             )
         try:
-            bln_path = infer_event_image_path_from_frame(event_info["events"]) or str(DEFAULT_IMAGE)
+            bln_path = (
+                alignment_bln_background_path
+                or infer_event_image_path_from_frame(event_info["events"])
+                or str(DEFAULT_IMAGE)
+            )
             score_identity_col = event_identity_column(score_result)
             pixel_identity_col = event_identity_column(event_info["event_pixels"])
             scored_event_pixels = event_info["event_pixels"][
@@ -5490,6 +5720,59 @@ def run_hough_seed_pipeline(params: PipelineParams) -> dict:
     }
 
 
+def run_hough_seed_pipeline_with_progress(params: PipelineParams, label: str) -> dict:
+    progress = st.progress(0.0, text=f"{label}: loading and preprocessing image")
+    status = st.empty()
+    try:
+        status.caption("Preprocessing selected image region...")
+        preprocessing = run_preprocessing(params)
+        progress.progress(0.45, text=f"{label}: preprocessing complete")
+
+        crop = preprocessing["crop"]
+        ridge_result = preprocessing["ridge"]
+        crop_height, crop_width = crop["display_rgb"].shape[:2]
+        status.caption("Loading GRX overlay crop...")
+        grx_overlay = load_display_crop_at(
+            params.grx_overlay_path,
+            crop["origin"][0],
+            crop["origin"][1],
+            crop_width,
+            crop_height,
+        )
+        progress.progress(0.55, text=f"{label}: loading overlay complete")
+
+        def hough_progress(done: int, total: int, stage: str) -> None:
+            if total <= 0:
+                progress.progress(0.60, text=f"{label}: {stage}")
+                return
+            fraction = 0.60 + 0.35 * (done / total)
+            progress.progress(
+                min(0.95, fraction),
+                text=f"{label}: {stage} {done:,}/{total:,}",
+            )
+
+        status.caption("Detecting Hough lines and selecting seeds...")
+        hough = hough_seed_method(
+            ridge_result["detection_mask"],
+            ridge_result["enhanced"],
+            params.hough_threshold,
+            params.hough_line_length,
+            params.hough_line_gap,
+            params.hough_seed_spacing,
+            None if params.hough_use_all_seeds else params.hough_max_seeds,
+            progress_callback=hough_progress,
+        )
+        progress.progress(1.0, text=f"{label}: complete")
+        return {
+            **preprocessing,
+            "grx_overlay": grx_overlay,
+            "hough": hough,
+        }
+    finally:
+        progress.empty()
+        status.empty()
+
+
 def trace_hough_events_for_result(result: dict, params: PipelineParams) -> dict:
     if not hough_source_matches_result(result, params):
         result = run_hough_seed_pipeline(params)
@@ -5504,6 +5787,41 @@ def trace_hough_events_for_result(result: dict, params: PipelineParams) -> dict:
         "params": params,
         "hough_events": hough_events,
     }
+
+
+def trace_hough_events_for_result_with_progress(result: dict, params: PipelineParams, label: str) -> dict:
+    if not hough_source_matches_result(result, params):
+        result = run_hough_seed_pipeline_with_progress(params, label="Running Hough Step 1 first")
+
+    progress = st.progress(0.0, text=f"{label}: 0/{len(result['hough']['seeds']):,} seeds")
+    status = st.empty()
+
+    def seed_progress(done: int, total: int) -> None:
+        if total <= 0:
+            progress.progress(1.0, text=f"{label}: no seeds")
+            return
+        progress.progress(
+            done / total,
+            text=f"{label}: {done:,}/{total:,} seeds",
+        )
+        status.caption(f"Tracing seed {done:,} of {total:,}")
+
+    try:
+        hough_events = grow_events_from_seeds(
+            result["hough"]["seeds"],
+            result["ridge"]["grow_rgb"],
+            params,
+            progress_callback=seed_progress,
+        )
+        progress.progress(1.0, text=f"{label}: complete")
+        return {
+            **result,
+            "params": params,
+            "hough_events": hough_events,
+        }
+    finally:
+        progress.empty()
+        status.empty()
 
 
 def run_pipeline(params: PipelineParams) -> dict:
@@ -5537,15 +5855,21 @@ def hough_seed_method(
     line_gap: int,
     seed_spacing: int,
     max_seeds: int | None,
+    progress_callback=None,
 ) -> dict:
+    if progress_callback is not None:
+        progress_callback(0, 1, "running probabilistic Hough transform")
     hough_lines = probabilistic_hough_line(
         detection_mask,
         threshold=threshold,
         line_length=line_length,
         line_gap=line_gap,
     )
+    if progress_callback is not None:
+        progress_callback(0, max(1, len(hough_lines)), "extracting seed candidates")
     seed_candidates = []
-    for p0, p1 in hough_lines:
+    total_lines = max(1, len(hough_lines))
+    for index, (p0, p1) in enumerate(hough_lines, start=1):
         x0, y0 = p0
         x1, y1 = p1
         rr, cc = draw_line(y0, x0, y1, x1)
@@ -5556,8 +5880,12 @@ def hough_seed_method(
             continue
         best = int(np.argmax(enhanced[rr, cc]))
         seed_candidates.append((int(rr[best]), int(cc[best]), float(enhanced[rr[best], cc[best]])))
+        if progress_callback is not None and (index == total_lines or index % 25 == 0):
+            progress_callback(index, total_lines, "extracting seed candidates")
 
     effective_max_seeds = len(seed_candidates) if max_seeds is None else max_seeds
+    if progress_callback is not None:
+        progress_callback(total_lines, total_lines, "selecting spaced seeds")
     seeds = select_spaced_seeds(seed_candidates, enhanced.shape, seed_spacing, effective_max_seeds)
     return {
         "lines": hough_lines,
@@ -5596,14 +5924,22 @@ def regionprops_seed_method(
     }
 
 
-def grow_events_from_seeds(seeds: list[Point], image_rgb: np.ndarray, params: PipelineParams) -> dict:
+def grow_events_from_seeds(
+    seeds: list[Point],
+    image_rgb: np.ndarray,
+    params: PipelineParams,
+    progress_callback=None,
+) -> dict:
     accepted_entries: list[dict] = []
     rejected = 0
     duplicates = 0
     merged = 0
     covered = 0
 
-    for seed in seeds:
+    if progress_callback is not None:
+        progress_callback(0, len(seeds))
+    total_seeds = max(1, len(seeds))
+    for seed_index, seed in enumerate(seeds, start=1):
         result = detect_line_from_seed(
             seed.x,
             seed.y,
@@ -5615,6 +5951,8 @@ def grow_events_from_seeds(seeds: list[Point], image_rgb: np.ndarray, params: Pi
         )
         if result.line is None:
             rejected += 1
+            if progress_callback is not None and (seed_index == total_seeds or seed_index % 5 == 0):
+                progress_callback(seed_index, len(seeds))
             continue
         merge_indices = [
             index
@@ -5636,6 +5974,8 @@ def grow_events_from_seeds(seeds: list[Point], image_rgb: np.ndarray, params: Pi
             merged += 1
         else:
             accepted_entries.append({"line": result.line, "seeds": {seed}, "was_merged": False})
+        if progress_callback is not None and (seed_index == total_seeds or seed_index % 5 == 0):
+            progress_callback(seed_index, len(seeds))
 
     accepted = [entry["line"] for entry in accepted_entries]
     standalone_seeds = [
@@ -8513,6 +8853,23 @@ def load_ang_trace_vector_data(path_str: str, chunk_size: int = 250_000, schema_
     return pd.concat(chunks, ignore_index=True)
 
 
+def load_ang_trace_vector_data_with_progress(
+    path_str: str,
+    chunk_size: int = 250_000,
+    label: str = "Generating trace vectors",
+    schema_version: int = 2,
+) -> pd.DataFrame:
+    _ = schema_version
+    ang_core = load_ang_core_data(path_str)
+    return build_trace_vectors_from_frame_with_progress(
+        ang_core["data"],
+        add_slip_trace_vectors_to_ang_chunk,
+        chunk_size=chunk_size,
+        label=label,
+        empty_columns=["x_ebsd", "y_ebsd", "phi1", "PHI", "phi2", "prism", "basal"],
+    )
+
+
 def add_slip_trace_vectors_to_ang_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     euler = chunk[["phi1", "PHI", "phi2"]].to_numpy(dtype=np.float64)
     prism, basal = calc_slip_trace_vectors_for_euler(euler)
@@ -8561,6 +8918,57 @@ def build_dic_space_trace_vector_data(
                 "basal",
             ]
         )
+    return pd.concat(chunks, ignore_index=True)
+
+
+def build_dic_space_trace_vector_data_with_progress(
+    dic_coords: pd.DataFrame,
+    forward_params: np.ndarray,
+    chunk_size: int = 250_000,
+    label: str = "Generating trace vectors",
+    schema_version: int = 1,
+) -> pd.DataFrame:
+    _ = schema_version
+    return build_trace_vectors_from_frame_with_progress(
+        dic_coords,
+        lambda chunk: add_dic_space_slip_trace_vectors_to_chunk(chunk, forward_params),
+        chunk_size=chunk_size,
+        label=label,
+        empty_columns=["x_dic", "y_dic", "x_ebsd", "y_ebsd", "phi1", "PHI", "phi2", "prism", "basal"],
+    )
+
+
+def build_trace_vectors_from_frame_with_progress(
+    frame: pd.DataFrame,
+    chunk_builder,
+    chunk_size: int,
+    label: str,
+    empty_columns: list[str],
+) -> pd.DataFrame:
+    total_rows = int(len(frame))
+    if total_rows == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    chunk_size = max(1, int(chunk_size))
+    total_chunks = int(np.ceil(total_rows / chunk_size))
+    progress = st.progress(0.0, text=f"{label}: 0/{total_rows:,} rows")
+    status = st.empty()
+    chunks = []
+    try:
+        for chunk_index, start in enumerate(range(0, total_rows, chunk_size), start=1):
+            stop = min(start + chunk_size, total_rows)
+            status.caption(f"{label}: chunk {chunk_index:,}/{total_chunks:,}")
+            chunks.append(chunk_builder(frame.iloc[start:stop]))
+            progress.progress(
+                stop / total_rows,
+                text=f"{label}: {stop:,}/{total_rows:,} rows",
+            )
+    finally:
+        progress.empty()
+        status.empty()
+
+    if not chunks:
+        return pd.DataFrame(columns=empty_columns)
     return pd.concat(chunks, ignore_index=True)
 
 
