@@ -11,3 +11,4 @@ check_traces.py
 *.ang
 *.bmp
 .DS_Store
+.agents*
