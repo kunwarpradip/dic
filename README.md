@@ -8,7 +8,7 @@ This repository contains a Streamlit workflow for DIC event detection, EBSD boun
 
 ```bash
 git clone <REPOSITORY_URL>
-cd DIC_Local_App
+cd dic
 ```
 
 2. Create and activate the conda environment:
