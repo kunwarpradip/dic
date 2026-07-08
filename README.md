@@ -29,13 +29,13 @@ hcp_slip_twin_miller_indices/
 
 Large `.tif`, `.ang`, and output `.csv` files may be provided separately through Git LFS or a shared drive. Keep them in the same folder paths expected by the app. -->
 
-3. Start the Streamlit app:
+3. Start the Streamlit app from the repository root:
 
 ```bash
 streamlit run tests/streamlit_seed_method_compare.py
 ```
 
-5. Open the local URL shown in the terminal, usually:
+4. Open the local URL shown in the terminal, usually:
 
 ```text
 http://localhost:8501

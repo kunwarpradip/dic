@@ -29,21 +29,19 @@ from skimage.exposure import equalize_adapthist
 from skimage.filters import meijering, threshold_otsu
 from skimage.transform import probabilistic_hough_line
 
-import DIC_check_slip_twin_traces_hcp as hcp_trace_module
-from DIC_check_slip_traces_bcc import calcSlipTracesBCC110, calcSlipTracesBCC112
-
-hcp_trace_module = importlib.reload(hcp_trace_module)
-calcSlipTracesHCPBasal = hcp_trace_module.calcSlipTracesHCPBasal
-calcSlipTracesHCPPrism = hcp_trace_module.calcSlipTracesHCPPrism
-calcSlipTracesHCPPyra_I_A = hcp_trace_module.calcSlipTracesHCPPyra_I_A
-calcSlipTracesHCPPyra_I_CA = hcp_trace_module.calcSlipTracesHCPPyra_I_CA
-calcSlipTracesHCPPyra_II_CA = hcp_trace_module.calcSlipTracesHCPPyra_II_CA
-calcTwinTracesHCP = hcp_trace_module.calcTwinTracesHCP
-
 
 def find_project_root() -> Path:
+    candidates = [Path(__file__).resolve(), Path.cwd(), *Path.cwd().parents]
+    for start in candidates:
+        path = start if start.is_dir() else start.parent
+        for candidate in [path, *path.parents]:
+            if (
+                (candidate / "dic_qt").exists()
+                and (candidate / "DIC_check_slip_twin_traces_hcp.py").exists()
+            ):
+                return candidate
     for path in [Path.cwd(), *Path.cwd().parents]:
-        if (path / "dic_qt").exists() and (path / "z_share_DIC_data_for_hv_mvu_pk").exists():
+        if (path / "dic_qt").exists():
             return path
     return Path("/Users/pkunwar/Desktop/DIC_Local_App")
 
@@ -52,8 +50,18 @@ ROOT = find_project_root()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import DIC_check_slip_twin_traces_hcp as hcp_trace_module  # noqa: E402
+from DIC_check_slip_traces_bcc import calcSlipTracesBCC110, calcSlipTracesBCC112  # noqa: E402
 from dic_qt.core.algorithm import detect_line_from_seed  # noqa: E402
 from dic_qt.core.models import DicLine, Point  # noqa: E402
+
+hcp_trace_module = importlib.reload(hcp_trace_module)
+calcSlipTracesHCPBasal = hcp_trace_module.calcSlipTracesHCPBasal
+calcSlipTracesHCPPrism = hcp_trace_module.calcSlipTracesHCPPrism
+calcSlipTracesHCPPyra_I_A = hcp_trace_module.calcSlipTracesHCPPyra_I_A
+calcSlipTracesHCPPyra_I_CA = hcp_trace_module.calcSlipTracesHCPPyra_I_CA
+calcSlipTracesHCPPyra_II_CA = hcp_trace_module.calcSlipTracesHCPPyra_II_CA
+calcTwinTracesHCP = hcp_trace_module.calcTwinTracesHCP
 
 
 DEFAULT_IMAGE = ROOT / "z_share_DIC_data_for_hv_mvu_pk" / "Ti_Cryo" / "Fused_BlN_step3.tif"
