@@ -7,8 +7,6 @@ Written by Duncan Greeley (dgreeley@lanl.gov) and others.
 # ---- Import packages ----
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-import matplotlib.pyplot as plt
-from matplotlib.image import imread
 from pathlib import Path
 
 # =============================================================================
@@ -494,6 +492,8 @@ def calcTwinTracesHCP(bunge_euler,twin_mode,ang_format,latparm_a,latparm_c,ebsd_
 
 
 def plotAnySlipTwinTrace(img,row,col,trace_vec):
+    import matplotlib.pyplot as plt
+
     
     #%matplotlib qt5
     #%matplotlib inline
@@ -512,6 +512,8 @@ def plotAnySlipTwinTrace(img,row,col,trace_vec):
 
         
 if __name__ == "__main__":
+    from matplotlib.image import imread
+
     # =============================================================================
     # %% ---- User Inputs ----
     # =============================================================================
