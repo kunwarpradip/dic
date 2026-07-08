@@ -18,7 +18,7 @@ conda env create -f dic_qt/environment.yml
 conda activate dicqt
 ```
 
-3. Make sure the required data folders are present in the project root:
+<!-- 3. Make sure the required data folders are present in the project root:
 
 ```text
 z_share_DIC_data_for_hv_mvu_pk/
@@ -27,9 +27,9 @@ z_share_EBSD_data_for_hv_mvu_pk/
 hcp_slip_twin_miller_indices/
 ```
 
-Large `.tif`, `.ang`, and output `.csv` files may be provided separately through Git LFS or a shared drive. Keep them in the same folder paths expected by the app.
+Large `.tif`, `.ang`, and output `.csv` files may be provided separately through Git LFS or a shared drive. Keep them in the same folder paths expected by the app. -->
 
-4. Start the Streamlit app:
+3. Start the Streamlit app:
 
 ```bash
 streamlit run tests/streamlit_seed_method_compare.py
