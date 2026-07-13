@@ -46,3 +46,11 @@ http://localhost:8501
 - The first tab, `Crystal Setup`, controls which crystal structure and slip/twin trace modes are used during alignment scoring.
 - HCP pyramidal and twin modes require the CSV files inside `hcp_slip_twin_miller_indices/`.
 - If the app cannot find a default image or CSV, use the file upload/path controls inside the relevant tab.
+
+## Runnning Alignment Tool
+
+1. At the root folder:
+
+```bash
+python -m dic_qt.app
+```
