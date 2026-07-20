@@ -12,3 +12,4 @@ check_traces.py
 *.bmp
 .DS_Store
 .agents*
+/bcc

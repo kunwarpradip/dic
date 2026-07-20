@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from io import BytesIO
 import importlib
@@ -91,6 +91,61 @@ DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV = (
 )
 HCP_MILLER_INDEX_DIR = ROOT / "hcp_slip_twin_miller_indices"
 hcp_trace_module.HCP_MILLER_INDEX_DIR = HCP_MILLER_INDEX_DIR
+
+PROJECT_FILE_DEFAULTS = {
+    "app_bln_image_path": "",
+    "app_grx_image_path": "",
+    "app_ang_path": "",
+    "app_ebsd_image_path": "",
+    "app_ebsd_boundary_path": "",
+    "app_transform_json_path": "",
+}
+
+LEGACY_PROJECT_FILE_DEFAULTS = {
+    "app_bln_image_path": str(DEFAULT_IMAGE),
+    "app_grx_image_path": str(DEFAULT_GRX_IMAGE),
+    "app_ang_path": str(DEFAULT_ANG_FILE),
+    "app_ebsd_image_path": str(DEFAULT_EBSD_IMAGE),
+    "app_ebsd_boundary_path": str(DEFAULT_EBSD_BOUNDARY_MAP),
+    "app_transform_json_path": str(DEFAULT_ALIGNMENT_TRANSFORM_JSON),
+}
+
+PROJECT_FILE_LABELS = {
+    "app_bln_image_path": "BLN image",
+    "app_grx_image_path": "GRX image",
+    "app_ang_path": "ANG file",
+    "app_ebsd_image_path": "EBSD image",
+    "app_ebsd_boundary_path": "EBSD boundary image",
+    "app_transform_json_path": "Transformation JSON",
+}
+
+
+def initialize_project_file_state() -> None:
+    if st.session_state.get("project_file_state_version") != 2:
+        for key, legacy_default in LEGACY_PROJECT_FILE_DEFAULTS.items():
+            if str(st.session_state.get(key, "")).strip() == legacy_default:
+                st.session_state[key] = ""
+        st.session_state["project_file_state_version"] = 2
+    for key, default_path in PROJECT_FILE_DEFAULTS.items():
+        st.session_state.setdefault(key, str(default_path))
+
+
+def reset_project_file_state() -> None:
+    for key in PROJECT_FILE_DEFAULTS:
+        st.session_state[key] = ""
+
+
+def project_file_path(key: str) -> str:
+    value = str(st.session_state.get(key, "")).strip()
+    if not value:
+        return ""
+    return str(Path(value).expanduser())
+
+
+def project_file_exists(key: str) -> bool:
+    path = project_file_path(key)
+    return bool(path) and Path(path).exists()
+
 CROP_SELECTOR_COMPONENT = components.declare_component(
     "dic_crop_selector",
     path=str(ROOT / "tests" / "streamlit_components" / "crop_selector"),
@@ -163,6 +218,21 @@ HCP_FILE_BACKED_MODES = {
     "{11-24} Twin (Compression) - 6x plane traces": "hcp_twin_c3_miller.csv",
 }
 
+EVENT_SHAPE_TYPE_OPTIONS = [
+    "linear",
+    "blob_like",
+    "irregular",
+    "fragmented",
+    "small_noise",
+]
+
+DEFAULT_SCORING_SHAPE_TYPES = [
+    "linear",
+    "irregular",
+    "fragmented",
+    "small_noise",
+]
+
 
 @dataclass(frozen=True)
 class PipelineParams:
@@ -170,6 +240,8 @@ class PipelineParams:
     grx_overlay_path: str
     display_min: float
     display_max: float
+    display_brightness: float
+    display_contrast: float
     use_full_image: bool
     crop_x: int
     crop_y: int
@@ -210,6 +282,7 @@ def main() -> None:
         "seed into the Java-style DIC event-growing algorithm."
     )
 
+    initialize_project_file_state()
     base_params = sidebar_params()
     (
         tab_crystal_setup,
@@ -237,6 +310,25 @@ def main() -> None:
 
     with tab_crystal_setup:
         crystal_setup_tab()
+
+    if base_params is None:
+        with tab_region:
+            st.info("Enter a valid BLN image path in the sidebar first.")
+        with tab_processing:
+            st.info("Enter a valid BLN image path in the sidebar first.")
+        with tab_results:
+            st.info("Enter a valid BLN image path in the sidebar first.")
+        with tab_detection_analysis:
+            st.info("Enter a valid BLN image path in the sidebar first.")
+        with tab_category_dashboard:
+            st.info("Enter a valid BLN image path in the sidebar first.")
+        with tab_boundary_cut:
+            boundary_cut_tab()
+        with tab_alignment:
+            alignment_tab(None)
+        with tab_event_analysis:
+            event_analysis_tab()
+        return
 
     with tab_region:
         params = processing_region_controls(base_params)
@@ -371,6 +463,39 @@ def main() -> None:
 
     with tab_event_analysis:
         event_analysis_tab()
+
+
+def project_files_sidebar_section() -> None:
+    st.sidebar.markdown("**Project Files**")
+    st.sidebar.caption(
+        "Set the shared local file paths once here. The detection, boundary, alignment, and dashboard tabs reuse these paths."
+    )
+
+    for key, label in PROJECT_FILE_LABELS.items():
+        st.sidebar.text_input(
+            label,
+            key=key,
+            help="Paste a local path from this machine. This avoids Streamlit upload size limits for large files.",
+        )
+
+    st.session_state["alignment_transform_json_path"] = project_file_path("app_transform_json_path")
+    st.session_state["alignment_ang_path"] = project_file_path("app_ang_path")
+    st.session_state["alignment_transform_json_path_input"] = project_file_path("app_transform_json_path")
+    st.session_state["alignment_ang_path_input"] = project_file_path("app_ang_path")
+    st.session_state["alignment_bln_background_path_input"] = project_file_path("app_bln_image_path")
+    st.session_state["ebsd_cuts_image_path"] = project_file_path("app_ebsd_image_path")
+    st.session_state["ebsd_image_path"] = project_file_path("app_ebsd_image_path")
+    st.session_state["boundary_cut_boundary_path"] = project_file_path("app_ebsd_boundary_path")
+    st.session_state["auto_boundary_cut_boundary_path"] = project_file_path("app_ebsd_boundary_path")
+    st.session_state["alignment_score_overlay_boundary_path"] = project_file_path("app_ebsd_boundary_path")
+    st.session_state["event_cut_inspector_boundary_path"] = project_file_path("app_ebsd_boundary_path")
+
+    st.sidebar.markdown("**File Status**")
+    for key, label in PROJECT_FILE_LABELS.items():
+        path = project_file_path(key)
+        status = "found" if path and Path(path).exists() else "missing"
+        name = Path(path).name if path else "not set"
+        st.sidebar.caption(f"{label}: {status} ({name})")
 
 
 def crystal_setup_tab() -> None:
@@ -793,7 +918,7 @@ def ebsd_cuts_tab(params: PipelineParams) -> None:
         "high EBSD color-gradient pixels in black."
     )
 
-    ebsd_path = st.text_input("EBSD image path", str(DEFAULT_EBSD_IMAGE), key="ebsd_cuts_image_path")
+    ebsd_path = st.text_input("EBSD image path", project_file_path("app_ebsd_image_path"), key="ebsd_cuts_image_path")
     ebsd_path = str(Path(ebsd_path).expanduser())
     if not Path(ebsd_path).exists():
         st.error(f"EBSD image not found: {ebsd_path}")
@@ -972,7 +1097,7 @@ def ebsd_processing_tab() -> None:
         "from high color-gradient pixels, then optionally cleaned, closed, and thinned."
     )
 
-    ebsd_path = st.text_input("EBSD image path", str(DEFAULT_EBSD_IMAGE), key="ebsd_image_path")
+    ebsd_path = st.text_input("EBSD image path", project_file_path("app_ebsd_image_path"), key="ebsd_image_path")
     ebsd_path = str(Path(ebsd_path).expanduser())
     if not Path(ebsd_path).exists():
         st.error(f"EBSD image not found: {ebsd_path}")
@@ -1350,6 +1475,22 @@ def detection_analysis_tab(params: PipelineParams) -> None:
     with st.expander("Detailed statistics", expanded=False):
         st.dataframe(pd.DataFrame([stats]), width="stretch")
 
+    st.markdown("**Save Metrics**")
+    metrics_prefix = st.text_input(
+        "Metrics file prefix",
+        value=default_detection_analysis_prefix(result),
+        key="detection_analysis_metrics_prefix",
+        help="Used to create <prefix>_detection_metrics.csv and <prefix>_detection_metrics.json under tests/outputs/detection_analysis.",
+    )
+    if st.button("Save detection analysis metrics", key="save_detection_analysis_metrics"):
+        try:
+            saved_paths = save_detection_analysis_metrics(result, analysis_signature, metrics_prefix)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.success("Saved detection-analysis metrics:")
+            st.code("\n".join(str(path) for path in saved_paths), language="text")
+
     st.markdown("**Overlays**")
     st.caption(
         "Quality overlays: green = detected slip overlap, red = automatic false positive, "
@@ -1596,22 +1737,20 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
     )
 
     col1, col2 = st.columns(2)
-    st.session_state.setdefault("alignment_transform_json_path", "")
-    st.session_state.setdefault("alignment_ang_path", "")
+    st.session_state.setdefault("alignment_transform_json_path", project_file_path("app_transform_json_path"))
+    st.session_state.setdefault("alignment_ang_path", project_file_path("app_ang_path"))
     st.session_state.setdefault("alignment_transform_json_path_input", st.session_state["alignment_transform_json_path"])
     st.session_state.setdefault("alignment_ang_path_input", st.session_state["alignment_ang_path"])
     with col1:
         st.text_input(
             "Transformation JSON path",
             key="alignment_transform_json_path_input",
-            placeholder="/path/to/alignment_transformation.json",
             help="JSON saved from the DIC/EBSD alignment tool. Paste the local path.",
         )
     with col2:
         st.text_input(
             "ANG file path",
             key="alignment_ang_path_input",
-            placeholder="/path/to/orientation_data.ang",
             help="EBSD orientation data file in .ang format. Paste the local path.",
         )
     st.session_state["alignment_transform_json_path"] = str(
@@ -1620,17 +1759,6 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
     st.session_state["alignment_ang_path"] = str(
         Path(str(st.session_state.get("alignment_ang_path_input", "")).strip()).expanduser()
     ) if str(st.session_state.get("alignment_ang_path_input", "")).strip() else ""
-
-    if st.button("Use default alignment files", key="alignment_use_default_files"):
-        st.session_state["alignment_transform_json_path"] = str(DEFAULT_ALIGNMENT_TRANSFORM_JSON)
-        st.session_state["alignment_ang_path"] = str(DEFAULT_ANG_FILE)
-        st.session_state["alignment_transform_json_path_input"] = str(DEFAULT_ALIGNMENT_TRANSFORM_JSON)
-        st.session_state["alignment_ang_path_input"] = str(DEFAULT_ANG_FILE)
-        st.session_state["alignment_events_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
-        st.session_state["alignment_event_pixels_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-        st.session_state["alignment_events_path_input"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
-        st.session_state["alignment_event_pixels_path_input"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-        st.rerun()
 
     transform_path = st.session_state.get("alignment_transform_json_path", "")
     ang_path = st.session_state.get("alignment_ang_path", "")
@@ -1643,10 +1771,9 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
     alignment_bln_background_path = st.text_input(
         "BLN background image path for Alignment overlays",
         key="alignment_bln_background_path_input",
-        placeholder="/path/to/Fused_BlN_step3.tif",
         help=(
             "Used as the background for event-shape and event-scoring overlays. "
-            "Defaults to the BLN image path from the sidebar, but can be changed here."
+            "Uses the shared BLN path unless changed here."
         ),
     )
     alignment_bln_background_path = (
@@ -1749,22 +1876,34 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
 
         if transform is not None:
             st.markdown("**ANG Coordinates In DIC Space**")
+            dic_meta = transform["metadata"]
+            dic_shape = dic_meta.get("dic_image_shape") or []
+            dic_height = int(dic_shape[0]) if len(dic_shape) >= 2 else None
+            dic_width = int(dic_shape[1]) if len(dic_shape) >= 2 else None
+            ang_to_ebsd_mapping = ang_grid_to_ebsd_pixel_mapping(meta, dic_meta, ang_core["data"])
             st.caption(
-                "Forward polynomial transform applied to normalized EBSD grid coordinates: "
-                "x_ebsd/y_ebsd -> x_dic/y_dic."
+                "ANG physical x/y are first normalized to ANG grid coordinates, then scaled into the EBSD image "
+                "pixel coordinate system used by the saved alignment transform. The forward polynomial then maps "
+                "EBSD pixels to DIC pixels."
             )
+            mapping_cols = st.columns(6)
+            mapping_cols[0].metric("ANG cols", f"{ang_to_ebsd_mapping['ang_ncols']:,}")
+            mapping_cols[1].metric("ANG rows", f"{ang_to_ebsd_mapping['ang_nrows']:,}")
+            mapping_cols[2].metric("EBSD width", f"{ang_to_ebsd_mapping['ebsd_width'] or 'missing'}")
+            mapping_cols[3].metric("EBSD height", f"{ang_to_ebsd_mapping['ebsd_height'] or 'missing'}")
+            mapping_cols[4].metric("x scale", f"{ang_to_ebsd_mapping['x_scale']:.6g}")
+            mapping_cols[5].metric("y scale", f"{ang_to_ebsd_mapping['y_scale']:.6g}")
+            st.caption(f"Coordinate mapping: {ang_to_ebsd_mapping['source']}")
             try:
                 dic_coords = transform_ang_coordinates_to_dic(
                     ang_core["data"],
                     transform["forward_params"],
+                    x_ebsd_scale=float(ang_to_ebsd_mapping["x_scale"]),
+                    y_ebsd_scale=float(ang_to_ebsd_mapping["y_scale"]),
                 )
             except Exception as exc:
                 st.error(f"Could not transform ANG coordinates to DIC coordinates: {exc}")
             else:
-                dic_meta = transform["metadata"]
-                dic_shape = dic_meta.get("dic_image_shape") or []
-                dic_height = int(dic_shape[0]) if len(dic_shape) >= 2 else None
-                dic_width = int(dic_shape[1]) if len(dic_shape) >= 2 else None
                 coord_metrics = dic_coordinate_metrics(dic_coords, dic_width, dic_height)
                 metric_cols = st.columns(6)
                 metric_cols[0].metric("x DIC min", f"{coord_metrics['x_dic_min']:.1f}")
@@ -1893,6 +2032,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
                         ang_path,
                         label="Generating EBSD-space basal/prismatic preview trace vectors",
                         schema_version=3,
+                        transform_metadata=transform["metadata"] if transform is not None else None,
                     )
             except Exception as exc:
                 st.error(f"Could not generate slip trace vectors: {exc}")
@@ -1937,14 +2077,12 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
         st.text_input(
             "Events CSV path after EBSD cut",
             key="alignment_events_path_input",
-            placeholder="/path/to/boundary_cut_events.csv",
             help="Post-cut event-level CSV, usually saved from Boundary Cut. Paste the local path.",
         )
     with event_col2:
         st.text_input(
             "Event pixels CSV path after EBSD cut",
             key="alignment_event_pixels_path_input",
-            placeholder="/path/to/boundary_cut_event_pixels.csv",
             help="Post-cut event pixel CSV with event_id, pixel_x, pixel_y. Paste the local path.",
         )
     st.session_state["alignment_events_path"] = str(
@@ -2118,8 +2256,9 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
         morphology_bln_path = (
             alignment_bln_background_path
             or infer_event_image_path_from_frame(event_info["events"])
-            or str(DEFAULT_IMAGE)
+            or project_file_path("app_bln_image_path")
         )
+        morphology_boundary_path = project_file_path("app_ebsd_boundary_path")
         if not Path(morphology_bln_path).exists():
             st.warning(f"BLN image not found for overlays: {morphology_bln_path}")
         else:
@@ -2133,7 +2272,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
             overlay_signature = (
                 morphology_signature,
                 str(morphology_bln_path),
-                str(DEFAULT_EBSD_BOUNDARY_MAP),
+                str(morphology_boundary_path),
             )
             if st.button("Load event shape overlays", key="alignment_load_event_shape_overlays"):
                 use_full_shape_overlay = event_shape_overlay_uses_full_image(
@@ -2155,7 +2294,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
                                 margin=0,
                                 max_dim=int(shape_overlay_max_dim),
                                 full_image=use_full_shape_overlay,
-                                boundary_path=str(DEFAULT_EBSD_BOUNDARY_MAP),
+                                boundary_path=str(morphology_boundary_path),
                                 boundary_threshold=0.20,
                             ),
                         }
@@ -2226,9 +2365,41 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
             help="Optional line-quality gate. Set to 0 to classify only by angle and lookup distance.",
         )
 
+    available_shape_types = EVENT_SHAPE_TYPE_OPTIONS
+    if morphology_result is not None and "event_type" in morphology_result.columns:
+        found_shape_types = sorted(morphology_result["event_type"].dropna().astype(str).unique().tolist())
+        available_shape_types = [event_type for event_type in EVENT_SHAPE_TYPE_OPTIONS if event_type in found_shape_types]
+        available_shape_types.extend(
+            event_type for event_type in found_shape_types if event_type not in available_shape_types
+        )
+    default_shape_types = [
+        event_type for event_type in DEFAULT_SCORING_SHAPE_TYPES if event_type in available_shape_types
+    ]
+    if not default_shape_types:
+        default_shape_types = available_shape_types.copy()
+    selected_scoring_shape_types = st.multiselect(
+        "Event shape types to include in scoring",
+        available_shape_types,
+        default=default_shape_types,
+        key="alignment_score_shape_types_included",
+        help=(
+            "Uses the EBSD-cut event shape analysis. Events whose shape type is not selected are excluded before "
+            "trace-angle scoring. Default keeps the earlier behavior by excluding blob_like events."
+        ),
+        disabled=morphology_result is None,
+    )
+    if morphology_result is None:
+        st.caption("Run EBSD-cut event shape analysis first to filter scoring by shape type. Until then, scoring uses all events.")
+    elif not selected_scoring_shape_types:
+        st.warning("No event shape types are selected. Scoring will return no events.")
+
     can_score = transform is not None and dic_coords is not None
+    if morphology_result is not None and not selected_scoring_shape_types:
+        can_score = False
     if not can_score:
         st.info("Load transformation JSON and ANG data first, then event scoring can use transformed ANG trace vectors.")
+        if morphology_result is not None and not selected_scoring_shape_types:
+            st.info("Select at least one event shape type to score.")
     score_signature = (
         str(events_path),
         str(event_pixels_path),
@@ -2239,42 +2410,47 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
         float(angle_tolerance_deg),
         float(max_lookup_distance),
         float(min_linearity),
+        tuple(sorted(selected_scoring_shape_types)),
     )
     if st.button("Score events", type="primary", key="alignment_score_events", disabled=not can_score):
         try:
             with st.spinner("Scoring events against selected crystal trace directions..."):
                 scoring_events = event_info["events"]
                 scoring_event_pixels = event_info["event_pixels"]
-                excluded_blob_ids: set[str] = set()
+                excluded_shape_ids: set[str] = set()
                 score_diagnostics = {
                     "loaded_event_rows": int(len(event_info["events"])),
                     "loaded_event_pixel_ids": int(event_info["event_pixels"]["event_id"].astype(str).nunique()),
                     "morphology_rows": int(len(morphology_result)) if morphology_result is not None else 0,
-                    "morphology_blob_like": 0,
-                    "blob_ids_intersecting_loaded_pixels": 0,
-                    "blob_ids_missing_from_loaded_pixels": 0,
+                    "included_shape_types": ", ".join(selected_scoring_shape_types) if selected_scoring_shape_types else "",
+                    "excluded_shape_ids": 0,
+                    "included_shape_ids_in_pixels": 0,
+                    "excluded_shape_ids_in_pixels": 0,
                     "events_sent_to_scoring": 0,
                 }
                 if morphology_result is not None and "event_type" in morphology_result.columns:
                     morphology_identity_col = event_identity_column(morphology_result)
                     scoring_events_identity_col = event_identity_column(scoring_events)
                     scoring_pixels_identity_col = event_identity_column(scoring_event_pixels)
-                    excluded_blob_ids = set(
+                    included_shape_types = set(str(event_type) for event_type in selected_scoring_shape_types)
+                    included_shape_ids = set(
                         morphology_result.loc[
-                            morphology_result["event_type"].astype(str) == "blob_like",
+                            morphology_result["event_type"].astype(str).isin(included_shape_types),
                             morphology_identity_col,
                         ].astype(str)
                     )
+                    all_shape_ids = set(morphology_result[morphology_identity_col].astype(str))
+                    excluded_shape_ids = all_shape_ids - included_shape_ids
                     loaded_pixel_ids = set(scoring_event_pixels[scoring_pixels_identity_col].astype(str))
-                    score_diagnostics["morphology_blob_like"] = int(len(excluded_blob_ids))
-                    score_diagnostics["blob_ids_intersecting_loaded_pixels"] = int(len(excluded_blob_ids & loaded_pixel_ids))
-                    score_diagnostics["blob_ids_missing_from_loaded_pixels"] = int(len(excluded_blob_ids - loaded_pixel_ids))
-                    if excluded_blob_ids:
+                    score_diagnostics["excluded_shape_ids"] = int(len(excluded_shape_ids))
+                    score_diagnostics["included_shape_ids_in_pixels"] = int(len(included_shape_ids & loaded_pixel_ids))
+                    score_diagnostics["excluded_shape_ids_in_pixels"] = int(len(excluded_shape_ids & loaded_pixel_ids))
+                    if excluded_shape_ids:
                         scoring_events = scoring_events[
-                            ~scoring_events[scoring_events_identity_col].astype(str).isin(excluded_blob_ids)
+                            ~scoring_events[scoring_events_identity_col].astype(str).isin(excluded_shape_ids)
                         ].copy()
                         scoring_event_pixels = scoring_event_pixels[
-                            ~scoring_event_pixels[scoring_pixels_identity_col].astype(str).isin(excluded_blob_ids)
+                            ~scoring_event_pixels[scoring_pixels_identity_col].astype(str).isin(excluded_shape_ids)
                         ].copy()
                 score_diagnostics["events_sent_to_scoring"] = int(scoring_event_pixels["event_id"].astype(str).nunique())
                 score_result = score_events_with_trace_alignment(
@@ -2291,7 +2467,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
             st.error(f"Event scoring failed: {exc}")
         else:
             st.session_state["alignment_event_score_result"] = score_result
-            st.session_state["alignment_event_score_excluded_blob_ids"] = sorted(excluded_blob_ids)
+            st.session_state["alignment_event_score_excluded_shape_ids"] = sorted(excluded_shape_ids)
             st.session_state["alignment_event_score_diagnostics"] = score_diagnostics
             st.session_state["alignment_event_score_signature"] = score_signature
 
@@ -2302,22 +2478,24 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
             score_result = None
     if score_result is not None:
         class_counts = score_result["classification"].value_counts().to_dict()
-        excluded_blob_ids = set(st.session_state.get("alignment_event_score_excluded_blob_ids", []))
+        excluded_shape_ids = set(st.session_state.get("alignment_event_score_excluded_shape_ids", []))
         result_cols = st.columns(5)
         result_cols[0].metric("Scored events", f"{len(score_result):,}")
         result_cols[1].metric("Matched events", f"{class_counts.get('likely_real', 0):,}")
         result_cols[2].metric("Uncertain", f"{class_counts.get('uncertain', 0):,}")
         result_cols[3].metric("Noise events", f"{class_counts.get('likely_noise', 0):,}")
-        result_cols[4].metric("Blob-like excluded", f"{len(excluded_blob_ids):,}")
+        result_cols[4].metric("Shape-excluded", f"{len(excluded_shape_ids):,}")
         diagnostics = st.session_state.get("alignment_event_score_diagnostics", {})
         if diagnostics:
             diag_cols = st.columns(6)
             diag_cols[0].metric("Loaded event rows", f"{diagnostics.get('loaded_event_rows', 0):,}")
             diag_cols[1].metric("Loaded pixel IDs", f"{diagnostics.get('loaded_event_pixel_ids', 0):,}")
             diag_cols[2].metric("Shape rows", f"{diagnostics.get('morphology_rows', 0):,}")
-            diag_cols[3].metric("Shape blobs", f"{diagnostics.get('morphology_blob_like', 0):,}")
-            diag_cols[4].metric("Blob IDs in pixels", f"{diagnostics.get('blob_ids_intersecting_loaded_pixels', 0):,}")
+            diag_cols[3].metric("Included shape IDs", f"{diagnostics.get('included_shape_ids_in_pixels', 0):,}")
+            diag_cols[4].metric("Excluded shape IDs", f"{diagnostics.get('excluded_shape_ids_in_pixels', 0):,}")
             diag_cols[5].metric("Sent to scoring", f"{diagnostics.get('events_sent_to_scoring', 0):,}")
+            if diagnostics.get("included_shape_types"):
+                st.caption(f"Included shape types: {diagnostics['included_shape_types']}")
         st.dataframe(score_result, width="stretch", hide_index=True)
         st.markdown("**Reality Score Overlay**")
         st.caption(
@@ -2337,7 +2515,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
         if overlay_boundary:
             boundary_path = st.text_input(
                 "EBSD boundary map",
-                str(DEFAULT_EBSD_BOUNDARY_MAP),
+                project_file_path("app_ebsd_boundary_path"),
                 key="alignment_score_overlay_boundary_path",
                 help="Black/white aligned EBSD boundary image. Dark pixels are treated as boundaries.",
             )
@@ -2420,7 +2598,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
             bln_path = (
                 alignment_bln_background_path
                 or infer_event_image_path_from_frame(event_info["events"])
-                or str(DEFAULT_IMAGE)
+                or project_file_path("app_bln_image_path")
             )
             score_identity_col = event_identity_column(score_result)
             pixel_identity_col = event_identity_column(event_info["event_pixels"])
@@ -2656,7 +2834,7 @@ def event_analysis_tab() -> None:
         st.session_state["event_cut_inspector_original_pixels_path"] = str(DEFAULT_FULL_DETECTED_EVENT_PIXELS_CSV)
         st.session_state["event_cut_inspector_cut_events_path"] = str(DEFAULT_EBSD_CUT_EVENTS_CSV)
         st.session_state["event_cut_inspector_cut_pixels_path"] = str(DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV)
-        st.session_state["event_cut_inspector_boundary_path"] = str(DEFAULT_EBSD_BOUNDARY_MAP)
+        st.session_state["event_cut_inspector_boundary_path"] = project_file_path("app_ebsd_boundary_path")
 
     with st.expander("Default files used by this tab", expanded=False):
         st.code(
@@ -2665,7 +2843,7 @@ def event_analysis_tab() -> None:
                     f"Original event pixels CSV: {DEFAULT_FULL_DETECTED_EVENT_PIXELS_CSV}",
                     f"Cut events CSV: {DEFAULT_EBSD_CUT_EVENTS_CSV}",
                     f"Cut event pixels CSV: {DEFAULT_EBSD_CUT_EVENT_PIXELS_CSV}",
-                    f"EBSD boundary image: {DEFAULT_EBSD_BOUNDARY_MAP}",
+                    f"EBSD boundary image: {project_file_path('app_ebsd_boundary_path')}",
                 ]
             ),
             language="text",
@@ -2732,7 +2910,7 @@ def event_analysis_tab() -> None:
         show_labels = st.checkbox("Label cut segments", value=True, key="event_cut_inspector_labels")
 
     try:
-        bln_path = infer_event_image_path_from_frame(cut_events) or str(DEFAULT_IMAGE)
+        bln_path = infer_event_image_path_from_frame(cut_events) or project_file_path("app_bln_image_path")
         inspection = build_boundary_cut_inspection_overlay(
             bln_path,
             boundary_path,
@@ -2788,7 +2966,7 @@ def manual_boundary_cut_tab() -> None:
     with col2:
         boundary_path = st.text_input(
             "EBSD boundary map",
-            str(DEFAULT_EBSD_BOUNDARY_MAP),
+            project_file_path("app_ebsd_boundary_path"),
             key="boundary_cut_boundary_path",
             help="Black/white image where black pixels are grain boundaries.",
         )
@@ -2814,7 +2992,7 @@ def manual_boundary_cut_tab() -> None:
     if inferred_bln_path:
         st.caption(f"BLN background image inferred from events CSV: `{inferred_bln_path}`")
     else:
-        st.caption(f"BLN background image fallback: `{DEFAULT_IMAGE}`")
+        st.caption(f"BLN background image fallback: `{project_file_path('app_bln_image_path')}`")
 
     st.markdown("**Cut Controls**")
     c1, c2, c3, c4 = st.columns(4)
@@ -2977,7 +3155,7 @@ def auto_boundary_cut_tab() -> None:
 
     boundary_path = st.text_input(
         "EBSD boundary map",
-        str(DEFAULT_EBSD_BOUNDARY_MAP),
+        project_file_path("app_ebsd_boundary_path"),
         key="auto_boundary_cut_boundary_path",
         help="Black/white image already aligned to the DIC coordinate system.",
     )
@@ -3156,7 +3334,7 @@ def check_boundary_cut_events_tab() -> None:
     with col2:
         bln_path_input = st.text_input(
             "BLN image path",
-            st.session_state.get("check_cuts_bln_loaded_path", str(DEFAULT_IMAGE)),
+            st.session_state.get("check_cuts_bln_loaded_path", project_file_path("app_bln_image_path")),
             key="check_cuts_bln_path_input",
             help=(
                 "Local path to the BLN/DIC image used as the background. "
@@ -3168,7 +3346,7 @@ def check_boundary_cut_events_tab() -> None:
     if default_clicked:
         st.session_state["check_cuts_event_pixels_loaded_path"] = str(DEFAULT_FULL_DETECTED_EVENT_PIXELS_CSV)
         st.session_state["check_cuts_events_loaded_path"] = str(DEFAULT_FULL_DETECTED_EVENTS_CSV)
-        st.session_state["check_cuts_bln_loaded_path"] = str(DEFAULT_IMAGE)
+        st.session_state["check_cuts_bln_loaded_path"] = project_file_path("app_bln_image_path")
 
     if event_pixels_file is not None:
         st.session_state["check_cuts_event_pixels_loaded_path"] = str(
@@ -3319,7 +3497,7 @@ def run_boundary_cut_from_frames(
     if not {"event_id", "pixel_x", "pixel_y"}.issubset(event_pixels.columns):
         raise ValueError("Event pixels data must include event_id, pixel_x, and pixel_y columns.")
 
-    bln_path = infer_event_image_path_from_frame(events) or str(DEFAULT_IMAGE)
+    bln_path = infer_event_image_path_from_frame(events) or project_file_path("app_bln_image_path")
     if not Path(bln_path).exists():
         raise ValueError(f"BLN image path from events CSV does not exist: {bln_path}")
 
@@ -3408,7 +3586,7 @@ def hough_result_to_boundary_cut_frames(
 
     crop = result["crop"]
     crop_x, crop_y = crop["origin"]
-    image_path = params.image_path if params is not None else str(DEFAULT_IMAGE)
+    image_path = params.image_path if params is not None else project_file_path("app_bln_image_path")
     created_at = datetime.now().astimezone().isoformat(timespec="seconds")
     pixel_rows = []
     event_rows = []
@@ -3847,19 +4025,14 @@ def run_detection_analysis(
     bln_display_max: float,
 ) -> dict:
     detected_pixels = pd.read_csv(detected_pixels_path)
-    slip_pixels = pd.read_csv(slip_mask_path)
+    slip_pixels = normalize_ground_truth_pixels(pd.read_csv(slip_mask_path))
 
     required_pixel_cols = {"event_id", "pixel_x", "pixel_y"}
-    required_slip_cols = {"SlipID", "MaskX", "MaskY"}
     if not required_pixel_cols.issubset(detected_pixels.columns):
         raise ValueError(f"Detected event pixels CSV must include columns: {sorted(required_pixel_cols)}")
-    if not required_slip_cols.issubset(slip_pixels.columns):
-        raise ValueError(f"Slip mask CSV must include columns: {sorted(required_slip_cols)}")
 
     detected_pixels["pixel_x"] = detected_pixels["pixel_x"].astype(int)
     detected_pixels["pixel_y"] = detected_pixels["pixel_y"].astype(int)
-    slip_pixels["MaskX"] = slip_pixels["MaskX"].astype(int)
-    slip_pixels["MaskY"] = slip_pixels["MaskY"].astype(int)
 
     grx_w, grx_h = image_size(grx_path)
     x_min = max(0, int(detected_pixels["pixel_x"].min()))
@@ -3897,15 +4070,15 @@ def run_detection_analysis(
         crop_shape=crop_shape,
     )
     slip_crop_pixels = slip_pixels[
-        (slip_pixels["MaskX"] >= x_min)
-        & (slip_pixels["MaskX"] <= x_max)
-        & (slip_pixels["MaskY"] >= y_min)
-        & (slip_pixels["MaskY"] <= y_max)
+        (slip_pixels["pixel_x"] >= x_min)
+        & (slip_pixels["pixel_x"] <= x_max)
+        & (slip_pixels["pixel_y"] >= y_min)
+        & (slip_pixels["pixel_y"] <= y_max)
     ].copy()
     slip_mask = pixels_to_crop_mask(
         slip_crop_pixels,
-        x_col="MaskX",
-        y_col="MaskY",
+        x_col="pixel_x",
+        y_col="pixel_y",
         crop_x=x_min,
         crop_y=y_min,
         crop_shape=crop_shape,
@@ -3917,7 +4090,7 @@ def run_detection_analysis(
             "detected_pixel_rows": int(len(detected_pixels)),
             "detected_event_ids": int(detected_pixels["event_id"].nunique()),
             "slip_rows_inside_crop": int(len(slip_crop_pixels)),
-            "slip_ids_inside_crop": int(slip_crop_pixels["SlipID"].nunique()) if len(slip_crop_pixels) else 0,
+            "slip_ids_inside_crop": int(slip_crop_pixels["gt_id"].nunique()) if len(slip_crop_pixels) else 0,
         }
     )
 
@@ -3934,6 +4107,91 @@ def run_detection_analysis(
         "grx_quality_overlay": draw_detection_quality_overlay(grx_rgb, detected_mask, slip_mask),
         "bln_quality_overlay": draw_detection_quality_overlay(bln_rgb, detected_mask, slip_mask),
     }
+
+
+def default_detection_analysis_prefix(result: dict) -> str:
+    crop = result["crop"]
+    return (
+        "detection_analysis_"
+        f"x{crop['x_min']}_y{crop['y_min']}_w{crop['width']}_h{crop['height']}"
+    )
+
+
+def save_detection_analysis_metrics(result: dict, analysis_signature: tuple, prefix: str) -> list[Path]:
+    safe_prefix = sanitize_file_prefix(prefix)
+    if not safe_prefix:
+        raise ValueError("Please provide a file prefix before saving.")
+
+    out_dir = ROOT / "tests" / "outputs" / "detection_analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"{safe_prefix}_detection_metrics.csv"
+    json_path = out_dir / f"{safe_prefix}_detection_metrics.json"
+
+    bln_path, grx_path, slip_mask_path, detected_pixels_path, bln_display_min, bln_display_max = analysis_signature
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    metrics_row = {
+        "created_at": created_at,
+        "bln_image": str(bln_path),
+        "grx_image": str(grx_path),
+        "ground_truth_csv": str(slip_mask_path),
+        "detected_event_pixels_csv": str(detected_pixels_path),
+        "bln_display_min": float(bln_display_min),
+        "bln_display_max": float(bln_display_max),
+        **flatten_dict_for_csv("crop", result["crop"]),
+        **result["stats"],
+    }
+    pd.DataFrame([metrics_row]).to_csv(csv_path, index=False)
+
+    metadata = {
+        "created_at": created_at,
+        "method": "detection_analysis_pixel_overlap",
+        "prefix": safe_prefix,
+        "outputs": {
+            "metrics_csv": str(csv_path),
+            "metrics_json": str(json_path),
+        },
+        "input_files": {
+            "bln_image": str(bln_path),
+            "grx_image": str(grx_path),
+            "ground_truth_csv": str(slip_mask_path),
+            "detected_event_pixels_csv": str(detected_pixels_path),
+        },
+        "display_parameters": {
+            "bln_display_min": float(bln_display_min),
+            "bln_display_max": float(bln_display_max),
+        },
+        "crop": result["crop"],
+        "metrics": result["stats"],
+    }
+    json_path.write_text(
+        json.dumps(metadata, indent=2, default=json_safe_value),
+        encoding="utf-8",
+    )
+    return [csv_path, json_path]
+
+
+def flatten_dict_for_csv(prefix: str, values: dict) -> dict:
+    return {f"{prefix}_{key}": value for key, value in values.items()}
+
+
+def json_safe_value(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Point):
+        return {"x": int(value.x), "y": int(value.y)}
+    if isinstance(value, DicLine):
+        return {
+            "id": value.id,
+            "size": int(value.size),
+            "points": [{"x": int(point.x), "y": int(point.y)} for point in value.points],
+        }
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def run_category_detection_dashboard(
@@ -4326,12 +4584,34 @@ def read_uploaded_or_path_csv(source) -> pd.DataFrame:
     return pd.read_csv(source)
 
 
+def normalize_ground_truth_pixels(frame: pd.DataFrame) -> pd.DataFrame:
+    """Accept Fiji slip masks or app-style event-pixel CSVs as ground truth."""
+    if {"SlipID", "MaskX", "MaskY"}.issubset(frame.columns):
+        out = frame[["SlipID", "MaskX", "MaskY"]].copy()
+        out = out.rename(columns={"SlipID": "gt_id", "MaskX": "pixel_x", "MaskY": "pixel_y"})
+    elif {"event_id", "pixel_x", "pixel_y"}.issubset(frame.columns):
+        out = frame[["event_id", "pixel_x", "pixel_y"]].copy()
+        out = out.rename(columns={"event_id": "gt_id"})
+    else:
+        raise ValueError(
+            "Ground-truth CSV must be either Fiji slip-mask format "
+            "['SlipID', 'MaskX', 'MaskY'] or app event-pixel format "
+            "['event_id', 'pixel_x', 'pixel_y']."
+        )
+
+    out["gt_id"] = out["gt_id"].astype(str)
+    out["pixel_x"] = pd.to_numeric(out["pixel_x"], errors="coerce")
+    out["pixel_y"] = pd.to_numeric(out["pixel_y"], errors="coerce")
+    out = out.dropna(subset=["pixel_x", "pixel_y"]).copy()
+    out["pixel_x"] = out["pixel_x"].round().astype(np.int64)
+    out["pixel_y"] = out["pixel_y"].round().astype(np.int64)
+    return out.drop_duplicates(subset=["gt_id", "pixel_x", "pixel_y"]).reset_index(drop=True)
+
+
 def slip_ground_truth_points(frame: pd.DataFrame) -> set[tuple[int, int]]:
-    required = {"MaskX", "MaskY"}
-    if not required.issubset(frame.columns):
-        raise ValueError(f"Ground-truth slip CSV must include columns: {sorted(required)}")
-    xs = frame["MaskX"].to_numpy(dtype=np.int64)
-    ys = frame["MaskY"].to_numpy(dtype=np.int64)
+    normalized = normalize_ground_truth_pixels(frame)
+    xs = normalized["pixel_x"].to_numpy(dtype=np.int64)
+    ys = normalized["pixel_y"].to_numpy(dtype=np.int64)
     return set(zip(xs.tolist(), ys.tolist(), strict=False))
 
 
@@ -4466,50 +4746,30 @@ def draw_mask_overlay(rgb: np.ndarray, mask: np.ndarray, color: tuple[int, int, 
     return out
 
 
-def sidebar_params() -> PipelineParams:
-    st.sidebar.markdown("**Input Images**")
-    st.sidebar.caption(
-        "Paste local image paths from this machine. Streamlit browsers cannot return a local file path "
-        "from a file-picker without uploading the file."
-    )
-    if st.sidebar.button("Use project default image paths", key="sidebar_use_default_image_paths"):
-        st.session_state["sidebar_bln_detection_image_path"] = str(DEFAULT_IMAGE)
-        st.session_state["sidebar_grx_overlay_image_path"] = str(DEFAULT_GRX_IMAGE)
-        st.rerun()
-    st.session_state.setdefault("sidebar_bln_detection_image_path", "")
-    st.session_state.setdefault("sidebar_grx_overlay_image_path", "")
-
-    image_path = st.sidebar.text_input(
-        "BLN detection image path",
-        key="sidebar_bln_detection_image_path",
-        placeholder="/path/to/Fused_BlN_step3.tif",
-        help="Required. Paste the local path to the BLN/DIC image used for detection.",
-    )
-    grx_overlay_path = st.sidebar.text_input(
-        "GRX overlay image path",
-        key="sidebar_grx_overlay_image_path",
-        placeholder="/path/to/Fused_GrX_step3_3pxGB_8bit.tif",
-        help="Optional. Paste the local path to the GRX image used for overlays.",
-    )
+def sidebar_params() -> PipelineParams | None:
+    project_files_sidebar_section()
+    image_path = project_file_path("app_bln_image_path")
+    grx_overlay_path = project_file_path("app_grx_image_path")
     if not image_path.strip():
-        st.sidebar.info("Enter a BLN detection image path to start.")
-        st.stop()
-    image_path = str(Path(image_path).expanduser())
-    grx_overlay_path = str(Path(grx_overlay_path).expanduser()) if grx_overlay_path.strip() else ""
+        st.sidebar.info("Enter a BLN image path to start.")
+        return None
     if not Path(image_path).exists():
         st.sidebar.error(f"Detection image not found: {image_path}")
-        st.stop()
+        return None
     if grx_overlay_path and not Path(grx_overlay_path).exists():
         st.sidebar.warning(f"GRX overlay image not found: {grx_overlay_path}")
         grx_overlay_path = ""
+    display_min, display_max, display_brightness, display_contrast = current_brightness_contrast_values(image_path)
     img_w, img_h = image_size(image_path)
     default_crop_size = min(500, img_w, img_h)
 
     return PipelineParams(
         image_path=image_path,
         grx_overlay_path=grx_overlay_path,
-        display_min=0.0,
-        display_max=1.0,
+        display_min=display_min,
+        display_max=display_max,
+        display_brightness=display_brightness,
+        display_contrast=display_contrast,
         use_full_image=False,
         crop_x=max(0, (img_w - default_crop_size) // 2),
         crop_y=max(0, (img_h - default_crop_size) // 2),
@@ -4563,8 +4823,35 @@ def processing_region_controls(params: PipelineParams) -> PipelineParams:
     img_w, img_h = image_size(params.image_path)
     st.subheader("Processing Region")
     st.caption(f"Detection image size: {img_w} x {img_h} pixels")
-    display_min, display_max = brightness_contrast_controls(params.image_path)
-    params = replace(params, display_min=display_min, display_max=display_max)
+    control_col, preview_col = st.columns([0.95, 1.35])
+    with control_col:
+        display_min, display_max, display_brightness, display_contrast = brightness_contrast_controls(params.image_path)
+    with preview_col:
+        preview = load_region_selector_preview(
+            params.image_path,
+            0,
+            0,
+            img_w,
+            img_h,
+            display_min,
+            display_max,
+            display_brightness,
+            display_contrast,
+            max_dim=1100,
+        )
+        st.markdown("**BLN Display Preview**")
+        st.image(
+            preview["image_data_url"],
+            caption="Current brightness/contrast preview; downsampled for display only.",
+            use_container_width=True,
+        )
+    params = replace(
+        params,
+        display_min=display_min,
+        display_max=display_max,
+        display_brightness=display_brightness,
+        display_contrast=display_contrast,
+    )
 
     mode = st.radio(
         "Region mode",
@@ -4580,6 +4867,22 @@ def processing_region_controls(params: PipelineParams) -> PipelineParams:
             "from the Detection Results tab when you are ready."
         )
         st.metric("Selected processing size", f"{img_w} x {img_h}")
+        preview = load_region_selector_preview(
+            params.image_path,
+            0,
+            0,
+            img_w,
+            img_h,
+            display_min,
+            display_max,
+            display_brightness,
+            display_contrast,
+        )
+        st.image(
+            preview["image_data_url"],
+            caption="Full BLN image with current brightness/contrast",
+            width="stretch",
+        )
         return replace(
             params,
             use_full_image=True,
@@ -4609,6 +4912,8 @@ def processing_region_controls(params: PipelineParams) -> PipelineParams:
         img_h,
         display_min,
         display_max,
+        display_brightness,
+        display_contrast,
     )
     st.caption(
         f"Crop selector uses the full BLN image downsampled to "
@@ -4648,6 +4953,8 @@ def processing_region_controls(params: PipelineParams) -> PipelineParams:
         crop_rect["height"],
         display_min,
         display_max,
+        display_brightness,
+        display_contrast,
     )
     st.caption(
         f"Selected crop: x={crop['origin'][0]}, y={crop['origin'][1]}, "
@@ -4655,7 +4962,7 @@ def processing_region_controls(params: PipelineParams) -> PipelineParams:
     )
     st.image(
         to_display(crop["display_rgb"]),
-        caption="Cropped BLN region with current brightness/contrast range",
+        caption="Cropped BLN region with current brightness/contrast",
         width='stretch',
     )
 
@@ -4973,6 +5280,8 @@ def load_preprocessing_region(params: PipelineParams) -> dict:
         params.crop_height,
         params.display_min,
         params.display_max,
+        params.display_brightness,
+        params.display_contrast,
     )
     return {
         "signature": region_signature(params),
@@ -5092,22 +5401,63 @@ def detection_rgb_to_unit_gray(detection_rgb: np.ndarray) -> np.ndarray:
     return np.clip(gray / 255.0, 0.0, 1.0)
 
 
-def brightness_contrast_controls(path_str: str) -> tuple[float, float]:
+def current_brightness_contrast_values(path_str: str) -> tuple[float, float, float, float]:
     summary = image_value_summary(path_str)
     raw_min = summary["min"]
     raw_max = summary["max"]
     if raw_max <= raw_min:
-        return raw_min, raw_max
+        return raw_min, raw_max, 0.0, 0.0
 
     range_key = f"display_range_values_v2:{path_str}"
-    slider_key = f"display_range_slider_v2:{path_str}"
+    brightness_key = f"display_brightness_adjust_v1:{path_str}"
+    contrast_key = f"display_contrast_adjust_v1:{path_str}"
+    base_range_key = f"display_base_range_v1:{path_str}"
     if range_key not in st.session_state:
         st.session_state[range_key] = default_display_range(raw_min, raw_max)
+    if base_range_key not in st.session_state:
+        st.session_state[base_range_key] = default_display_range(raw_min, raw_max)
+    st.session_state.setdefault(brightness_key, 0.0)
+    st.session_state.setdefault(contrast_key, 0.0)
+
+    display_min, display_max = display_range_from_adjustments(
+        st.session_state[base_range_key],
+        float(st.session_state[brightness_key]),
+        float(st.session_state[contrast_key]),
+        raw_min,
+        raw_max,
+    )
+    display_min, display_max = sanitize_display_range((display_min, display_max), raw_min, raw_max)
+    st.session_state[range_key] = (display_min, display_max)
+    return (
+        display_min,
+        display_max,
+        float(st.session_state[brightness_key]),
+        float(st.session_state[contrast_key]),
+    )
+
+
+def brightness_contrast_controls(path_str: str) -> tuple[float, float, float, float]:
+    summary = image_value_summary(path_str)
+    raw_min = summary["min"]
+    raw_max = summary["max"]
+    if raw_max <= raw_min:
+        return raw_min, raw_max, 0.0, 0.0
+
+    range_key = f"display_range_values_v2:{path_str}"
+    brightness_key = f"display_brightness_adjust_v1:{path_str}"
+    contrast_key = f"display_contrast_adjust_v1:{path_str}"
+    base_range_key = f"display_base_range_v1:{path_str}"
+    if range_key not in st.session_state:
+        st.session_state[range_key] = default_display_range(raw_min, raw_max)
+    if base_range_key not in st.session_state:
+        st.session_state[base_range_key] = default_display_range(raw_min, raw_max)
+    st.session_state.setdefault(brightness_key, 0.0)
+    st.session_state.setdefault(contrast_key, 0.0)
 
     st.subheader("Brightness / Contrast")
     st.caption(
-        "Fiji-style display range. This remaps raw BLN values to 0-255 before the later "
-        "preprocessing steps."
+        "Brightness and contrast use a familiar -100 to +100 adjustment. Positive brightness makes the mapped image brighter; "
+        "positive contrast increases contrast. The resulting mapped 0-255 image is used by later preprocessing steps."
     )
 
     col1, col2, col3, col4 = st.columns(4)
@@ -5119,38 +5469,132 @@ def brightness_contrast_controls(path_str: str) -> tuple[float, float]:
     button_col1, button_col2 = st.columns(2)
     with button_col1:
         if st.button("Auto range", help="Use the 0.5th and 99.5th percentile values."):
-            st.session_state[range_key] = (summary["p0_5"], summary["p99_5"])
-            st.session_state[slider_key] = st.session_state[range_key]
+            auto_range = sanitize_display_range((summary["p0_5"], summary["p99_5"]), raw_min, raw_max)
+            st.session_state[range_key] = auto_range
+            st.session_state[base_range_key] = auto_range
+            st.session_state[brightness_key] = 0.0
+            st.session_state[contrast_key] = 0.0
             st.rerun()
     with button_col2:
         if st.button("Reset range", help="Use the true minimum and maximum values."):
-            st.session_state[range_key] = (raw_min, raw_max)
-            st.session_state[slider_key] = st.session_state[range_key]
+            reset_range = (raw_min, raw_max)
+            st.session_state[range_key] = reset_range
+            st.session_state[base_range_key] = reset_range
+            st.session_state[brightness_key] = 0.0
+            st.session_state[contrast_key] = 0.0
             st.rerun()
 
     span = raw_max - raw_min
     step = max(span / 2000.0, 0.0001)
-    current = sanitize_display_range(st.session_state[range_key], raw_min, raw_max)
-    display_min, display_max = st.slider(
-        "Display range",
-        min_value=float(raw_min),
-        max_value=float(raw_max),
-        value=(float(current[0]), float(current[1])),
-        step=float(step),
-        key=slider_key,
-        help="Fiji/ImageJ-style brightness and contrast range. Values below the minimum map to black, above the maximum map to white, and values between map linearly to 0-255.",
+    slider_cols = st.columns(2)
+    with slider_cols[0]:
+        brightness = st.slider(
+            "Brightness",
+            min_value=-100.0,
+            max_value=100.0,
+            value=float(st.session_state[brightness_key]),
+            step=1.0,
+            key=brightness_key,
+            help="Positive values brighten the mapped image; negative values darken it.",
+        )
+    with slider_cols[1]:
+        contrast = st.slider(
+            "Contrast",
+            min_value=-100.0,
+            max_value=100.0,
+            value=float(st.session_state[contrast_key]),
+            step=1.0,
+            key=contrast_key,
+            help="Positive values increase contrast; negative values reduce contrast.",
+        )
+    display_min, display_max = display_range_from_adjustments(
+        st.session_state[base_range_key],
+        brightness,
+        contrast,
+        raw_min,
+        raw_max,
     )
     display_min, display_max = sanitize_display_range((display_min, display_max), raw_min, raw_max)
     st.session_state[range_key] = (display_min, display_max)
+
+    st.slider(
+        "Resulting display range",
+        min_value=float(raw_min),
+        max_value=float(raw_max),
+        value=(float(display_min), float(display_max)),
+        step=float(step),
+        disabled=True,
+        help="Computed raw-value range. Values below minimum map to black, above maximum map to white, and values between map linearly to 0-255.",
+    )
 
     midpoint = (display_min + display_max) / 2.0
     width = display_max - display_min
     cols = st.columns(4)
     cols[0].metric("Minimum", f"{display_min:.4g}")
     cols[1].metric("Maximum", f"{display_max:.4g}")
-    cols[2].metric("Brightness", f"{midpoint:.4g}")
-    cols[3].metric("Contrast width", f"{width:.4g}")
-    return display_min, display_max
+    cols[2].metric("Brightness", f"{float(brightness):+.0f}")
+    cols[3].metric("Contrast", f"{float(contrast):+.0f}")
+    st.caption(
+        f"Raw display window: min {display_min:.4g}, max {display_max:.4g}, width {width:.4g}. "
+        "Brightness/contrast is applied after this raw-value mapping."
+    )
+    return display_min, display_max, float(brightness), float(contrast)
+
+
+def brightness_contrast_from_display_range(
+    display_range: tuple[float, float],
+    raw_min: float,
+    raw_max: float,
+) -> tuple[float, float]:
+    display_min, display_max = sanitize_display_range(display_range, raw_min, raw_max)
+    span = max(float(raw_max - raw_min), 1e-12)
+    min_width = max(span / 2000.0, 0.0001)
+    width = max(min_width, min(float(display_max - display_min), span))
+    brightness = float((display_min + display_max) / 2.0)
+    if span <= min_width:
+        contrast = 0.0
+    else:
+        contrast = 100.0 * (1.0 - ((width - min_width) / (span - min_width)))
+    return brightness, float(np.clip(contrast, 0.0, 100.0))
+
+
+def display_range_from_adjustments(
+    base_range: tuple[float, float] | list[float],
+    brightness: float,
+    contrast: float,
+    raw_min: float,
+    raw_max: float,
+) -> tuple[float, float]:
+    raw_min = float(raw_min)
+    raw_max = float(raw_max)
+    span = raw_max - raw_min
+    if span <= 0:
+        return raw_min, raw_max
+    min_width = max(span / 2000.0, 0.0001)
+    base_min, base_max = sanitize_display_range(base_range, raw_min, raw_max)
+    base_center = (base_min + base_max) / 2.0
+    base_width = max(min_width, min(base_max - base_min, span))
+    brightness = float(np.clip(brightness, -100.0, 100.0))
+    contrast = float(np.clip(contrast, -100.0, 100.0))
+
+    # Positive brightness should make the mapped image brighter. In display-range
+    # terms that means shifting the raw-value window downward.
+    center = base_center - (brightness / 100.0) * (span / 2.0)
+    if contrast >= 0:
+        width = base_width * (1.0 - 0.95 * (contrast / 100.0))
+    else:
+        width = base_width + (span - base_width) * (abs(contrast) / 100.0)
+    width = max(min_width, min(width, span))
+    center = max(raw_min, min(center, raw_max))
+    display_min = center - width / 2.0
+    display_max = center + width / 2.0
+    if display_min < raw_min:
+        display_max += raw_min - display_min
+        display_min = raw_min
+    if display_max > raw_max:
+        display_min -= display_max - raw_max
+        display_max = raw_max
+    return sanitize_display_range((display_min, display_max), raw_min, raw_max)
 
 
 def sanitize_display_range(value: tuple[float, float] | list[float], raw_min: float, raw_max: float) -> tuple[float, float]:
@@ -5222,6 +5666,8 @@ def load_region_selector_preview(
     view_height: int,
     display_min: float | None = None,
     display_max: float | None = None,
+    brightness_adjust: float = 0.0,
+    contrast_adjust: float = 0.0,
     max_dim: int = 1400,
 ) -> dict:
     with Image.open(path_str) as img:
@@ -5234,7 +5680,7 @@ def load_region_selector_preview(
         preview_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         arr = np.asarray(preview_img).copy()
 
-    preview_rgb = display_crop_rgb(arr, display_min, display_max)
+    preview_rgb = display_crop_rgb(arr, display_min, display_max, brightness_adjust, contrast_adjust)
     return {
         "image_data_url": image_to_png_data_url(preview_rgb),
         "preview_width": int(preview_rgb.shape[1]),
@@ -5257,6 +5703,8 @@ def load_crop_by_rect(
     crop_height: int,
     display_min: float | None = None,
     display_max: float | None = None,
+    brightness_adjust: float = 0.0,
+    contrast_adjust: float = 0.0,
 ) -> dict:
     with Image.open(path_str) as img:
         img_w, img_h = img.size
@@ -5270,7 +5718,7 @@ def load_crop_by_rect(
 
     is_full_image = crop_width == img_w and crop_height == img_h and x0 == 0 and y0 == 0
     if arr.ndim == 3 and arr.shape[2] >= 3:
-        rgb = to_uint8_rgb(arr)
+        rgb = display_crop_rgb(arr, display_min, display_max, brightness_adjust, contrast_adjust)
         raw_note = "Full RGB image" if is_full_image else "RGB crop"
         return {
             "raw": arr,
@@ -5283,7 +5731,7 @@ def load_crop_by_rect(
             "note": raw_note,
         }
 
-    loaded_rgb = display_crop_rgb(arr, display_min, display_max)
+    loaded_rgb = display_crop_rgb(arr, display_min, display_max, brightness_adjust, contrast_adjust)
     raw_note = (
         "Full scalar image with brightness/contrast display and detection buffers"
         if is_full_image
@@ -6634,6 +7082,7 @@ def save_hough_events_csv(result: dict, prefix: str) -> dict:
 
     events_path = out_dir / f"{safe_prefix}_events.csv"
     pixels_path = out_dir / f"{safe_prefix}_event_pixels.csv"
+    metadata_path = out_dir / f"{safe_prefix}_metadata.json"
     crop = result["crop"]
     params = result["params"]
     crop_x, crop_y = crop["origin"]
@@ -6709,13 +7158,107 @@ def save_hough_events_csv(result: dict, prefix: str) -> dict:
         writer.writeheader()
         writer.writerows(pixel_rows)
 
+    metadata = build_hough_save_metadata(
+        result=result,
+        prefix=safe_prefix,
+        created_at=created_at,
+        events_path=events_path,
+        pixels_path=pixels_path,
+        metadata_path=metadata_path,
+        event_count=len(event_rows),
+        pixel_count=len(pixel_rows),
+        original_pixel_count=original_pixel_count,
+        duplicate_pixel_count=duplicate_pixel_count,
+        skipped_event_count=skipped_event_count,
+    )
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, default=json_safe_value),
+        encoding="utf-8",
+    )
+
     return {
         "event_count": len(event_rows),
         "pixel_count": len(pixel_rows),
         "original_pixel_count": original_pixel_count,
         "duplicate_pixel_count": duplicate_pixel_count,
         "skipped_event_count": skipped_event_count,
-        "paths": [events_path, pixels_path],
+        "paths": [events_path, pixels_path, metadata_path],
+    }
+
+
+def build_hough_save_metadata(
+    result: dict,
+    prefix: str,
+    created_at: str,
+    events_path: Path,
+    pixels_path: Path,
+    metadata_path: Path,
+    event_count: int,
+    pixel_count: int,
+    original_pixel_count: int,
+    duplicate_pixel_count: int,
+    skipped_event_count: int,
+) -> dict:
+    params = result["params"]
+    crop = result["crop"]
+    crop_height, crop_width = crop["display_rgb"].shape[:2]
+    ridge = result.get("ridge", {})
+    hough = result.get("hough", {})
+    hough_events = result.get("hough_events", {})
+    return {
+        "created_at": created_at,
+        "method": "hough_seed_event_growth",
+        "prefix": prefix,
+        "outputs": {
+            "events_csv": str(events_path),
+            "event_pixels_csv": str(pixels_path),
+            "metadata_json": str(metadata_path),
+        },
+        "input_files": {
+            "bln_image": params.image_path,
+            "grx_image": params.grx_overlay_path,
+        },
+        "processing_region": {
+            "use_full_image": bool(params.use_full_image),
+            "crop_x": int(crop["origin"][0]),
+            "crop_y": int(crop["origin"][1]),
+            "crop_width": int(crop_width),
+            "crop_height": int(crop_height),
+            "source_note": crop.get("note", ""),
+        },
+        "parameters": asdict(params),
+        "preprocessing_metrics": {
+            "candidate_ridge_pixels": int(np.asarray(ridge.get("candidate_mask", [])).sum()),
+            "clean_mask_pixels": int(np.asarray(ridge.get("candidate_clean", [])).sum()),
+            "seed_mask_pixels": int(np.asarray(ridge.get("detection_mask", [])).sum()),
+            "seed_mask_coverage_fraction": float(np.asarray(ridge.get("detection_mask", [])).mean())
+            if "detection_mask" in ridge
+            else None,
+            "ridge_threshold": ridge.get("ridge_threshold"),
+            "used_skeletonize": ridge.get("use_skeletonize"),
+        },
+        "hough_seed_metrics": {
+            "hough_lines": hough.get("raw_count"),
+            "candidate_seeds": hough.get("candidate_seed_count"),
+            "selected_seeds": len(hough.get("seeds", [])),
+            "max_seeds": hough.get("max_seeds"),
+            "use_all_seeds": hough.get("use_all_seeds"),
+        },
+        "event_growth_metrics": {
+            "detected_events_before_save": hough_events.get("accepted_count"),
+            "rejected_seeds": hough_events.get("rejected"),
+            "merged_candidates": hough_events.get("merged"),
+            "standalone_seed_count": len(hough_events.get("standalone_seeds", [])),
+            "merged_seed_count": len(hough_events.get("merged_seeds", [])),
+            "merged_group_count": len(hough_events.get("merged_groups", [])),
+        },
+        "save_metrics": {
+            "saved_event_count": int(event_count),
+            "saved_unique_event_pixels": int(pixel_count),
+            "original_event_pixels_before_deduplication": int(original_pixel_count),
+            "duplicate_pixel_rows_removed": int(duplicate_pixel_count),
+            "skipped_events_after_deduplication": int(skipped_event_count),
+        },
     }
 
 
@@ -8610,6 +9153,73 @@ def normalize_ang_xy_to_grid(data: pd.DataFrame, metadata: dict) -> tuple[pd.Dat
     }
 
 
+def metadata_int(metadata: dict, key: str) -> int | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def ang_grid_shape_from_metadata(metadata: dict) -> tuple[int | None, int | None]:
+    ncols = max(
+        [
+            value
+            for value in [
+                metadata_int(metadata, "NCOLS_ODD"),
+                metadata_int(metadata, "NCOLS_EVEN"),
+            ]
+            if value is not None
+        ],
+        default=None,
+    )
+    nrows = metadata_int(metadata, "NROWS")
+    return ncols, nrows
+
+
+def ebsd_image_size_from_transform_metadata(metadata: dict) -> tuple[int | None, int | None]:
+    shape = metadata.get("ebsd_image_shape") or []
+    if len(shape) >= 2:
+        return int(shape[1]), int(shape[0])
+    return None, None
+
+
+def ang_grid_to_ebsd_pixel_mapping(
+    ang_metadata: dict,
+    transform_metadata: dict,
+    data: pd.DataFrame,
+) -> dict:
+    ang_ncols, ang_nrows = ang_grid_shape_from_metadata(ang_metadata)
+    ebsd_width, ebsd_height = ebsd_image_size_from_transform_metadata(transform_metadata)
+    x_grid_max = float(data["x_grid"].max()) if len(data) else 0.0
+    y_grid_max = float(data["y_grid"].max()) if len(data) else 0.0
+    if ang_ncols is None or ang_ncols <= 1:
+        ang_ncols = int(round(x_grid_max)) + 1
+    if ang_nrows is None or ang_nrows <= 1:
+        ang_nrows = int(round(y_grid_max)) + 1
+
+    if ebsd_width is None or ebsd_height is None or ebsd_width <= 1 or ebsd_height <= 1:
+        x_scale = 1.0
+        y_scale = 1.0
+        source = "ANG grid coordinates; EBSD image size missing from transform metadata"
+    else:
+        x_scale = (float(ebsd_width) - 1.0) / max(float(ang_ncols) - 1.0, 1.0)
+        y_scale = (float(ebsd_height) - 1.0) / max(float(ang_nrows) - 1.0, 1.0)
+        source = "ANG grid scaled to EBSD image pixels"
+
+    return {
+        "ang_ncols": int(ang_ncols),
+        "ang_nrows": int(ang_nrows),
+        "ebsd_width": ebsd_width,
+        "ebsd_height": ebsd_height,
+        "x_scale": float(x_scale),
+        "y_scale": float(y_scale),
+        "source": source,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def build_ang_euler_rgb_image(data: pd.DataFrame) -> np.ndarray:
     required = {"phi1", "PHI", "phi2", "x_grid_round", "y_grid_round"}
@@ -8648,7 +9258,12 @@ def normalize_vector_to_uint8(values: np.ndarray) -> np.ndarray:
     return (np.clip((values - lo) / (hi - lo), 0.0, 1.0) * 255).astype(np.uint8)
 
 
-def transform_ang_coordinates_to_dic(ang_data: pd.DataFrame, forward_params: np.ndarray) -> pd.DataFrame:
+def transform_ang_coordinates_to_dic(
+    ang_data: pd.DataFrame,
+    forward_params: np.ndarray,
+    x_ebsd_scale: float = 1.0,
+    y_ebsd_scale: float = 1.0,
+) -> pd.DataFrame:
     required = {"x_grid", "y_grid", "phi1", "PHI", "phi2"}
     if not required.issubset(ang_data.columns):
         missing = sorted(required - set(ang_data.columns))
@@ -8658,14 +9273,20 @@ def transform_ang_coordinates_to_dic(ang_data: pd.DataFrame, forward_params: np.
     if params.shape[0] != 2 or params.shape[1] < 6:
         raise ValueError("Forward transform params must have shape 2 x 6 or larger.")
 
-    x = ang_data["x_grid"].to_numpy(dtype=np.float64)
-    y = ang_data["y_grid"].to_numpy(dtype=np.float64)
-    x_dic, y_dic = apply_quadratic_polynomial_transform(x, y, params)
+    x_grid = ang_data["x_grid"].to_numpy(dtype=np.float64)
+    y_grid = ang_data["y_grid"].to_numpy(dtype=np.float64)
+    x_ebsd = x_grid * float(x_ebsd_scale)
+    y_ebsd = y_grid * float(y_ebsd_scale)
+    x_dic, y_dic = apply_quadratic_polynomial_transform(x_ebsd, y_ebsd, params)
 
     out = pd.DataFrame(
         {
-            "x_ebsd": x.astype(np.float32),
-            "y_ebsd": y.astype(np.float32),
+            "x_ang_grid": x_grid.astype(np.float32),
+            "y_ang_grid": y_grid.astype(np.float32),
+            "x_ebsd": x_ebsd.astype(np.float32),
+            "y_ebsd": y_ebsd.astype(np.float32),
+            "x_ebsd_round": np.rint(x_ebsd).astype(np.int64),
+            "y_ebsd_round": np.rint(y_ebsd).astype(np.int64),
             "x_dic": x_dic.astype(np.float32),
             "y_dic": y_dic.astype(np.float32),
             "x_dic_round": np.rint(x_dic).astype(np.int64),
@@ -8858,11 +9479,25 @@ def load_ang_trace_vector_data_with_progress(
     chunk_size: int = 250_000,
     label: str = "Generating trace vectors",
     schema_version: int = 2,
+    transform_metadata: dict | None = None,
 ) -> pd.DataFrame:
     _ = schema_version
     ang_core = load_ang_core_data(path_str)
+    if transform_metadata is not None:
+        mapping = ang_grid_to_ebsd_pixel_mapping(
+            ang_core["metadata"],
+            transform_metadata,
+            ang_core["data"],
+        )
+        data = ang_core["data"].copy()
+        data["x_ebsd"] = data["x_grid"] * float(mapping["x_scale"])
+        data["y_ebsd"] = data["y_grid"] * float(mapping["y_scale"])
+    else:
+        data = ang_core["data"].copy()
+        data["x_ebsd"] = data["x_grid"]
+        data["y_ebsd"] = data["y_grid"]
     return build_trace_vectors_from_frame_with_progress(
-        ang_core["data"],
+        data,
         add_slip_trace_vectors_to_ang_chunk,
         chunk_size=chunk_size,
         label=label,
@@ -8873,10 +9508,12 @@ def load_ang_trace_vector_data_with_progress(
 def add_slip_trace_vectors_to_ang_chunk(chunk: pd.DataFrame) -> pd.DataFrame:
     euler = chunk[["phi1", "PHI", "phi2"]].to_numpy(dtype=np.float64)
     prism, basal = calc_slip_trace_vectors_for_euler(euler)
+    x_ebsd = chunk["x_ebsd"] if "x_ebsd" in chunk.columns else chunk["x_grid"]
+    y_ebsd = chunk["y_ebsd"] if "y_ebsd" in chunk.columns else chunk["y_grid"]
     return pd.DataFrame(
         {
-            "x_ebsd": chunk["x_grid"].to_numpy(dtype=np.float32),
-            "y_ebsd": chunk["y_grid"].to_numpy(dtype=np.float32),
+            "x_ebsd": x_ebsd.to_numpy(dtype=np.float32),
+            "y_ebsd": y_ebsd.to_numpy(dtype=np.float32),
             "phi1": chunk["phi1"].to_numpy(dtype=np.float32),
             "PHI": chunk["PHI"].to_numpy(dtype=np.float32),
             "phi2": chunk["phi2"].to_numpy(dtype=np.float32),
@@ -9648,7 +10285,13 @@ def direct_to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
     return gray_to_rgb(np.squeeze(values))
 
 
-def scale_to_uint8_rgb(arr: np.ndarray, display_min: float, display_max: float) -> np.ndarray:
+def scale_to_uint8_rgb(
+    arr: np.ndarray,
+    display_min: float,
+    display_max: float,
+    brightness_adjust: float = 0.0,
+    contrast_adjust: float = 0.0,
+) -> np.ndarray:
     values = np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
     display_min = float(display_min)
     display_max = float(display_max)
@@ -9658,6 +10301,7 @@ def scale_to_uint8_rgb(arr: np.ndarray, display_min: float, display_max: float) 
         scaled = (
             np.clip((values - display_min) / (display_max - display_min), 0.0, 1.0) * 255
         ).astype(np.uint8)
+    scaled = apply_display_brightness_contrast(scaled, brightness_adjust, contrast_adjust)
     if scaled.ndim == 2:
         return gray_to_rgb(scaled)
     if scaled.ndim == 3 and scaled.shape[2] >= 3:
@@ -9665,6 +10309,21 @@ def scale_to_uint8_rgb(arr: np.ndarray, display_min: float, display_max: float) 
     if scaled.ndim == 3 and scaled.shape[2] == 1:
         return gray_to_rgb(scaled[..., 0])
     return gray_to_rgb(np.squeeze(scaled))
+
+
+def apply_display_brightness_contrast(
+    arr: np.ndarray,
+    brightness_adjust: float = 0.0,
+    contrast_adjust: float = 0.0,
+) -> np.ndarray:
+    values = arr.astype(np.float32, copy=False)
+    brightness = float(np.clip(brightness_adjust, -100.0, 100.0)) / 100.0
+    contrast = float(np.clip(contrast_adjust, -100.0, 100.0)) / 100.0
+    # Standard display adjustment around mid-gray. Contrast changes slope;
+    # brightness shifts the output intensity.
+    contrast_factor = 1.0 + contrast if contrast >= 0 else 1.0 + 0.75 * contrast
+    adjusted = (values - 127.5) * contrast_factor + 127.5 + brightness * 127.5
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 def normalize_to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
@@ -9714,14 +10373,18 @@ def display_crop_rgb(
     arr: np.ndarray,
     display_min: float | None = None,
     display_max: float | None = None,
+    brightness_adjust: float = 0.0,
+    contrast_adjust: float = 0.0,
 ) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[2] >= 3:
-        return to_uint8_rgb(arr)
+        if display_min is not None and display_max is not None:
+            return scale_to_uint8_rgb(np.squeeze(arr), display_min, display_max, brightness_adjust, contrast_adjust)
+        return apply_display_brightness_contrast(to_uint8_rgb(arr), brightness_adjust, contrast_adjust)
     if arr.dtype == np.uint8:
-        return gray_to_rgb(np.squeeze(arr))
+        return apply_display_brightness_contrast(gray_to_rgb(np.squeeze(arr)), brightness_adjust, contrast_adjust)
     if display_min is not None and display_max is not None:
-        return scale_to_uint8_rgb(np.squeeze(arr), display_min, display_max)
-    return normalize_to_uint8_rgb(np.squeeze(arr))
+        return scale_to_uint8_rgb(np.squeeze(arr), display_min, display_max, brightness_adjust, contrast_adjust)
+    return apply_display_brightness_contrast(normalize_to_uint8_rgb(np.squeeze(arr)), brightness_adjust, contrast_adjust)
 
 
 def gray_to_rgb(gray: np.ndarray) -> np.ndarray:
