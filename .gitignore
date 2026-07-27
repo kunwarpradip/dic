@@ -13,3 +13,4 @@ check_traces.py
 .DS_Store
 .agents*
 /bcc
+*.pdf

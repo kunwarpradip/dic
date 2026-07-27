@@ -80,6 +80,7 @@ DEFAULT_FULL_DETECTED_EVENTS_CSV = (
 DEFAULT_FULL_DETECTED_EVENT_PIXELS_CSV = (
     ROOT / "tests" / "outputs" / "hough_events" / "full_ti_image_detection_event_pixels.csv"
 )
+BLN_TO_NM_SCALE = 138000.0 / 6144.0
 DEFAULT_EBSD_BOUNDARY_MAP = ROOT / "z_share_EBSD_DIC_alignment_data" / "check_ebsd_mask_manual_edits.png"
 DEFAULT_ALIGNMENT_TRANSFORM_JSON = (
     ROOT / "z_share_DIC_data_for_hv_mvu_pk" / "Ti_Cryo" / "app_data" / "alignment_transformation.json"
@@ -287,24 +288,24 @@ def main() -> None:
     (
         tab_crystal_setup,
         tab_region,
-        tab_processing,
         tab_results,
         tab_detection_analysis,
         tab_category_dashboard,
         tab_boundary_cut,
         tab_alignment,
         tab_event_analysis,
+        tab_slip_intensity,
     ) = st.tabs(
         [
             "Crystal Setup",
             "Processing Region",
-            "Further Processing",
             "Detection Results",
             "Detection Analysis",
             "Category Dashboard",
             "Boundary Cut",
             "Alignment",
             "Cut Event Analysis",
+            "Slip Intensity",
         ]
     )
 
@@ -313,8 +314,6 @@ def main() -> None:
 
     if base_params is None:
         with tab_region:
-            st.info("Enter a valid BLN image path in the sidebar first.")
-        with tab_processing:
             st.info("Enter a valid BLN image path in the sidebar first.")
         with tab_results:
             st.info("Enter a valid BLN image path in the sidebar first.")
@@ -328,24 +327,31 @@ def main() -> None:
             alignment_tab(None)
         with tab_event_analysis:
             event_analysis_tab()
+        with tab_slip_intensity:
+            st.info("Enter a valid BLN image path in the sidebar first.")
         return
 
     with tab_region:
         params = processing_region_controls(base_params)
 
-    with tab_processing:
-        params = further_processing_controls(params)
-
     with tab_results:
         stored_params = st.session_state.get("last_pipeline_params")
         stored_result = st.session_state.get("last_pipeline_result")
-        tab_hough_result, tab_region_result = st.tabs(["Hough Line Detection", "RegionProp Seed Detection"])
-        hough_detect_clicked = False
-        hough_trace_clicked = False
-        auto_run_hough = False
-        region_run_clicked = False
+        detection_method = st.radio(
+            "Detection method",
+            ["Hough Line Detection", "Trial Mask Events", "RegionProp Seed Detection"],
+            horizontal=True,
+            key="detection_results_method",
+            help=(
+                "Hough and RegionProp use the shared Further Processing stages. "
+                "Trial Mask Events uses its own mask-building steps."
+            ),
+        )
 
-        with tab_hough_result:
+        if detection_method == "Hough Line Detection":
+            st.markdown("**Further Processing For Hough**")
+            params = further_processing_controls(params)
+            st.divider()
             st.markdown("**Step 1: Detect Hough Lines And Seeds**")
             params = hough_method_controls(params, stored_result)
             auto_run_hough = st.checkbox(
@@ -418,7 +424,10 @@ def main() -> None:
                         st.warning("Step 2 result is from previous tracing settings. Run Step 2 again.")
                     show_hough_step2_result(stored_result)
 
-        with tab_region_result:
+        elif detection_method == "RegionProp Seed Detection":
+            st.markdown("**Further Processing For RegionProp**")
+            params = further_processing_controls(params)
+            st.divider()
             params = regionprops_method_controls(params, stored_result)
             region_run_clicked = st.button(
                 "Run / refresh detection",
@@ -426,28 +435,27 @@ def main() -> None:
                 key="run_regionprops_detection",
             )
 
-        if region_run_clicked:
-            label = "full-image" if params.use_full_image else "crop-based"
-            with st.spinner(f"Running {label} RegionProp detection..."):
-                stored_result = run_pipeline(params)
-                st.session_state["last_pipeline_params"] = params
-                st.session_state["last_pipeline_result"] = stored_result
-                stored_params = params
+            if region_run_clicked:
+                label = "full-image" if params.use_full_image else "crop-based"
+                with st.spinner(f"Running {label} RegionProp detection..."):
+                    stored_result = run_pipeline(params)
+                    st.session_state["last_pipeline_params"] = params
+                    st.session_state["last_pipeline_result"] = stored_result
+                    stored_params = params
 
-        if stored_result is None:
-            with tab_region_result:
+            if stored_result is None:
                 st.info("Select a processing region first, then press Run / refresh detection.")
-        else:
-            if not params_match_for_result(stored_params, params):
-                with tab_region_result:
+            else:
+                if not params_match_for_result(stored_params, params):
                     st.warning("Displayed result is from previous settings. Press Run / refresh detection to update.")
-
-            with tab_region_result:
                 if "regionprops" in stored_result:
                     show_detection_mask_metrics(stored_result)
                     show_regionprops_method_view(stored_result)
                 else:
-                    st.info("RegionProp results are not loaded. Press Run / refresh detection in this tab.")
+                    st.info("RegionProp results are not loaded. Press Run / refresh detection in this method.")
+
+        else:
+            trial_band_seed_tab(params)
 
     with tab_detection_analysis:
         detection_analysis_tab(params)
@@ -463,6 +471,9 @@ def main() -> None:
 
     with tab_event_analysis:
         event_analysis_tab()
+
+    with tab_slip_intensity:
+        slip_intensity_tab(params)
 
 
 def project_files_sidebar_section() -> None:
@@ -1339,41 +1350,49 @@ def detection_analysis_tab(params: PipelineParams) -> None:
         "missed slip pixels blue."
     )
 
-    bln_path = params.image_path
-    grx_path = params.grx_overlay_path
-    st.caption(f"Using BLN image from sidebar: `{bln_path}`")
-    st.caption(f"Using GRX image from sidebar: `{grx_path or 'not set'}`")
+    st.markdown("**Image Paths**")
+    image_cols = st.columns(2)
+    with image_cols[0]:
+        bln_path = st.text_input(
+            "BLN image path",
+            value=params.image_path,
+            key="analysis_bln_image_path",
+            help="Local path to the BLN image used for the BLN quality overlay.",
+        )
+    with image_cols[1]:
+        grx_path = st.text_input(
+            "GRX image path",
+            value=params.grx_overlay_path,
+            key="analysis_grx_image_path",
+            help="Local path to the GRX image used for the GRX quality overlay.",
+        )
+    bln_path = str(Path(str(bln_path).strip()).expanduser()) if str(bln_path).strip() else ""
+    grx_path = str(Path(str(grx_path).strip()).expanduser()) if str(grx_path).strip() else ""
 
+    st.markdown("**CSV Paths**")
     col_a, col_b = st.columns(2)
     with col_a:
-        slip_mask_file = st.file_uploader(
-            "Ground truth slip_mask_pixels.csv",
-            type=["csv"],
-            key="analysis_slip_mask_file",
-        )
         if st.button("Use default slip mask", key="analysis_use_default_slip_mask"):
-            st.session_state["analysis_slip_mask_path"] = str(DEFAULT_SLIP_MASK_CSV)
+            st.session_state["analysis_slip_mask_path_input"] = str(DEFAULT_SLIP_MASK_CSV)
+        slip_mask_path = st.text_input(
+            "Ground truth slip_mask_pixels.csv path",
+            value=st.session_state.get("analysis_slip_mask_path_input", str(DEFAULT_SLIP_MASK_CSV)),
+            key="analysis_slip_mask_path_input",
+            help="Local path to the ground-truth slip mask CSV.",
+        )
     with col_b:
-        detected_pixels_file = st.file_uploader(
-            "Detected event pixels CSV",
-            type=["csv"],
-            key="analysis_detected_pixels_file",
-        )
         if st.button("Use default detected pixels", key="analysis_use_default_detected_pixels"):
-            st.session_state["analysis_detected_pixels_path"] = str(DEFAULT_DETECTED_EVENT_PIXELS_CSV)
+            st.session_state["analysis_detected_pixels_path_input"] = str(DEFAULT_DETECTED_EVENT_PIXELS_CSV)
+        detected_pixels_path = st.text_input(
+            "Detected event pixels CSV path",
+            value=st.session_state.get("analysis_detected_pixels_path_input", str(DEFAULT_DETECTED_EVENT_PIXELS_CSV)),
+            key="analysis_detected_pixels_path_input",
+            help="Local path to the detected event pixels CSV.",
+        )
 
-    if slip_mask_file is not None:
-        st.session_state["analysis_slip_mask_path"] = str(
-            save_uploaded_streamlit_file(slip_mask_file, "detection_analysis")
-        )
-    if detected_pixels_file is not None:
-        st.session_state["analysis_detected_pixels_path"] = str(
-            save_uploaded_streamlit_file(detected_pixels_file, "detection_analysis")
-        )
-    slip_mask_path = st.session_state.get("analysis_slip_mask_path", str(DEFAULT_SLIP_MASK_CSV))
-    detected_pixels_path = st.session_state.get(
-        "analysis_detected_pixels_path",
-        str(DEFAULT_DETECTED_EVENT_PIXELS_CSV),
+    slip_mask_path = str(Path(str(slip_mask_path).strip()).expanduser()) if str(slip_mask_path).strip() else ""
+    detected_pixels_path = (
+        str(Path(str(detected_pixels_path).strip()).expanduser()) if str(detected_pixels_path).strip() else ""
     )
     st.caption(f"Ground truth slip pixels: `{slip_mask_path}`")
     st.caption(f"Detected event pixels: `{detected_pixels_path}`")
@@ -1501,6 +1520,178 @@ def detection_analysis_tab(params: PipelineParams) -> None:
         zoomable_image(result["grx_quality_overlay"], "GRX quality overlay", key="analysis_grx_quality")
     with col2:
         zoomable_image(result["bln_quality_overlay"], "BLN quality overlay", key="analysis_bln_quality")
+
+
+def trial_band_seed_tab(params: PipelineParams) -> None:
+    st.subheader("Trial: Mask Events")
+    st.caption(
+        "Experimental mask-based detector for finite-width bands. It thresholds the "
+        "CLAHE-enhanced band image, cleans the mask, then treats each connected mask "
+        "component as a detected event."
+    )
+
+    st.markdown("**Step 1: Load Current Processing Region**")
+    with st.spinner("Loading current crop/full image..."):
+        region_stage = load_preprocessing_region(params)
+    crop = region_stage["crop"]
+    stats = crop["raw_stats"]
+    st.caption(
+        f"Loaded region: origin x,y {crop['origin']} | "
+        f"size {crop['display_rgb'].shape[1]} x {crop['display_rgb'].shape[0]}"
+    )
+    show_step_images(
+        "Raw selected region, linear 0-255",
+        crop["raw_normalized_rgb"],
+        "Brightness/contrast mapped region",
+        crop["display_rgb"],
+        left_caption_suffix=f"min {stats['min']:.4g}, max {stats['max']:.4g}",
+    )
+
+    st.divider()
+    st.markdown("**Step 2: Apply CLAHE**")
+    clahe_clip_limit = st.slider(
+        "CLAHE clip limit",
+        0.001,
+        1.000,
+        float(params.clahe_clip_limit),
+        0.001,
+        key="trial_clahe_clip_limit",
+        help="Limits local contrast amplification before mask thresholding. Higher values reveal more local band detail but can amplify noise.",
+    )
+    trial_params = replace(params, clahe_clip_limit=clahe_clip_limit)
+    with st.spinner("Applying CLAHE..."):
+        clahe_stage = run_clahe_stage(region_stage, trial_params)
+    show_step_images(
+        "Input from Step 1",
+        crop["display_rgb"],
+        "CLAHE enhanced",
+        clahe_stage["enhanced"],
+        right_cmap="gray",
+    )
+
+    st.divider()
+    st.markdown("**Step 3: Threshold Band Mask**")
+    col1, col2 = st.columns(2)
+    with col1:
+        band_percentile = st.slider(
+            "Band intensity percentile",
+            50.0,
+            99.9,
+            90.0,
+            0.1,
+            key="trial_band_percentile",
+            help="Keeps CLAHE pixels above this percentile. Higher values keep only brighter band interiors.",
+        )
+    with col2:
+        band_otsu_multiplier = st.slider(
+            "Band Otsu multiplier",
+            0.1,
+            2.0,
+            0.8,
+            0.05,
+            key="trial_band_otsu_multiplier",
+            help="Scales the automatic Otsu threshold on the CLAHE image. The final threshold is max(percentile, Otsu x multiplier).",
+        )
+    threshold_stage = run_trial_band_threshold_stage(
+        clahe_stage,
+        float(band_percentile),
+        float(band_otsu_multiplier),
+    )
+    threshold_cols = st.columns(3)
+    threshold_cols[0].metric("Percentile threshold", f"{threshold_stage['percentile_threshold']:.4f}")
+    threshold_cols[1].metric("Otsu x multiplier threshold", f"{threshold_stage['otsu_threshold']:.4f}")
+    threshold_cols[2].metric("Final band threshold", f"{threshold_stage['band_threshold']:.4f}")
+    show_step_images(
+        "Input from Step 2",
+        clahe_stage["enhanced"],
+        "Raw threshold band mask",
+        threshold_stage["candidate_mask"],
+        left_cmap="gray",
+        right_cmap="gray",
+    )
+
+    st.divider()
+    st.markdown("**Step 4: Clean And Close Mask**")
+    col1, col2 = st.columns(2)
+    with col1:
+        band_min_pixels = st.slider(
+            "Min band object pixels",
+            1,
+            5000,
+            max(1, int(params.min_object_size)),
+            10,
+            key="trial_band_min_pixels",
+            help="Removes connected candidate-band regions smaller than this many pixels.",
+        )
+    with col2:
+        band_closing_radius = st.slider(
+            "Band closing radius",
+            0,
+            30,
+            max(0, int(params.closing_radius)),
+            1,
+            key="trial_band_closing_radius",
+            help="Bridges small gaps in the band mask. Larger values can connect nearby pieces into one event.",
+        )
+    clean_stage = run_trial_band_clean_stage(
+        threshold_stage,
+        min_pixels=int(band_min_pixels),
+        closing_radius=int(band_closing_radius),
+    )
+    show_step_images(
+        "Input from Step 3",
+        threshold_stage["candidate_mask"],
+        "Cleaned/closed event mask",
+        clean_stage["clean_mask"],
+        left_cmap="gray",
+        right_cmap="gray",
+    )
+
+    st.divider()
+    st.markdown("**Step 5: Label Components As Events**")
+    finalize_clicked = st.button(
+        "Finalize mask and overlay events",
+        type="primary",
+        key="trial_finalize_mask_events",
+        help="Use the current cleaned mask to label connected components as detected events and update the downstream pipeline result.",
+    )
+    current_signature = trial_mask_event_signature(clean_stage, trial_params)
+    if finalize_clicked:
+        progress = st.progress(0.0, text="Step 5: labeling connected mask components")
+        status = st.empty()
+
+        def finalize_progress(done: int, total: int, stage: str) -> None:
+            if total <= 0:
+                progress.progress(0.0, text=f"Step 5: {stage}")
+                status.caption(stage)
+                return
+            fraction = min(1.0, max(0.0, done / total))
+            progress.progress(fraction, text=f"Step 5: {stage} {done:,}/{total:,}")
+            status.caption(f"{stage}: {done:,} of {total:,}")
+
+        try:
+            result = build_trial_mask_event_result(
+                clean_stage,
+                trial_params,
+                progress_callback=finalize_progress,
+            )
+            progress.progress(1.0, text="Step 5: complete")
+        finally:
+            progress.empty()
+            status.empty()
+        st.session_state["last_trial_band_seed_result"] = result
+        st.session_state["last_trial_band_seed_signature"] = result["signature"]
+        st.session_state["last_pipeline_result"] = result
+        st.session_state["last_pipeline_params"] = trial_params
+
+    result = st.session_state.get("last_trial_band_seed_result")
+    result_signature = st.session_state.get("last_trial_band_seed_signature")
+    if result is None or "mask_events" not in result:
+        st.info("Tune Steps 1-4, then press Finalize mask and overlay events.")
+        return
+    if result_signature != current_signature:
+        st.warning("Displayed mask-event overlay is from previous settings. Press Finalize mask and overlay events to update it.")
+    show_trial_band_seed_result(result)
 
 
 def category_dashboard_tab(params: PipelineParams) -> None:
@@ -2947,6 +3138,534 @@ def event_analysis_tab() -> None:
     st.dataframe(inspection["cut_events"], width="stretch", hide_index=True)
 
 
+def slip_intensity_tab(params: PipelineParams) -> None:
+    st.subheader("Slip Intensity")
+    st.caption(
+        "For each loaded event, find the event pixel with the highest absolute BLN-map value, "
+        "convert that value to nm, then plot the distribution of those per-event peak slip intensities."
+    )
+    st.caption(
+        f"BLN to slip-intensity conversion: `slip intensity (nm) = abs(BLN value) x 138000 / 6144` "
+        f"= `abs(BLN value) x {BLN_TO_NM_SCALE:.6g}`."
+    )
+
+    create_tab, plot_tab = st.tabs(["Create Intensity CSV", "Plot Distributions"])
+
+    with create_tab:
+        st.markdown("**Pair One BLN Map With One Event Set**")
+        st.caption(
+            "Use this tab once per deformation state. It creates a CSV containing each event's "
+            "maximum BLN magnitude converted to nm."
+        )
+        bln_path = st.text_input(
+            "BLN map path",
+            value=params.image_path,
+            key="slip_intensity_create_bln_path",
+            help="Local path to the BLN map for this deformation state.",
+        )
+        bln_path = str(Path(bln_path).expanduser()) if str(bln_path).strip() else ""
+        event_cols = st.columns(2)
+        with event_cols[0]:
+            events_path = st.text_input(
+                "Events CSV path",
+                key="slip_intensity_create_events_path",
+                help="Event-level CSV. Used for optional metadata merge and provenance.",
+            )
+        with event_cols[1]:
+            event_pixels_path = st.text_input(
+                "Event pixels CSV path",
+                key="slip_intensity_create_event_pixels_path",
+                help="CSV with event_id, pixel_x, pixel_y columns in global DIC coordinates.",
+            )
+
+        if not bln_path or not Path(bln_path).exists():
+            st.info("Enter a valid BLN map path to view the sanity check and calculate event intensities.")
+        else:
+            st.markdown("**BLN Map Sanity Check**")
+            sanity_cols = st.columns(4)
+            with sanity_cols[0]:
+                sanity_max_dim = st.slider(
+                    "Sanity preview max dimension",
+                    400,
+                    2400,
+                    1200,
+                    100,
+                    key="slip_intensity_bln_sanity_max_dim",
+                    help="Downsamples the BLN map for a quick preview and value histogram.",
+                )
+            with sanity_cols[1]:
+                sanity_bins = st.slider(
+                    "Slip-intensity histogram bins",
+                    20,
+                    200,
+                    80,
+                    5,
+                    key="slip_intensity_bln_sanity_bins",
+                )
+            with sanity_cols[2]:
+                sanity_abs_values = st.checkbox(
+                    "Use magnitude",
+                    value=True,
+                    key="slip_intensity_bln_sanity_abs",
+                    help="Use abs(BLN value) before converting to nm. This matches slip-intensity magnitude.",
+                )
+            with sanity_cols[3]:
+                histogram_source = st.radio(
+                    "Histogram source",
+                    ["Preview sample", "Full resolution"],
+                    horizontal=False,
+                    key="slip_intensity_bln_hist_source",
+                    help="Full resolution reads every BLN pixel and can take longer for large TIFF files.",
+                )
+
+            try:
+                sanity = load_bln_sanity_preview(bln_path, int(sanity_max_dim))
+            except Exception as exc:
+                st.error(f"Could not load BLN sanity preview: {exc}")
+            else:
+                stat_cols = st.columns(5)
+                stat_cols[0].metric("Image size", f"{sanity['original_width']} x {sanity['original_height']}")
+                stat_cols[1].metric("Preview size", f"{sanity['preview_width']} x {sanity['preview_height']}")
+                stat_cols[2].metric("Min", f"{sanity['stats']['min']:.4g}")
+                stat_cols[3].metric("Median", f"{sanity['stats']['median']:.4g}")
+                stat_cols[4].metric("Max", f"{sanity['stats']['max']:.4g}")
+
+                preview_col, hist_col = st.columns(2)
+                with preview_col:
+                    st.caption(
+                        "Preview note: this BLN image uses raw sanity normalization, so it may look darker "
+                        "than the Processing Region view, which applies brightness/contrast display settings."
+                    )
+                    zoomable_image(
+                        sanity["preview_rgb"],
+                        "Downsampled BLN sanity preview",
+                        key="slip_intensity_bln_sanity_preview",
+                    )
+                with hist_col:
+                    if histogram_source == "Full resolution":
+                        with st.spinner("Loading full-resolution BLN values for histogram..."):
+                            hist_values = load_bln_full_resolution_values(bln_path)["values"]
+                        hist_title = "Full-Resolution Slip-Intensity Distribution"
+                    else:
+                        hist_values = sanity["values"]
+                        hist_title = "Downsampled Slip-Intensity Distribution"
+                    sanity_fig = plot_bln_value_distribution(
+                        hist_values,
+                        bins=int(sanity_bins),
+                        absolute_values=bool(sanity_abs_values),
+                        title=hist_title,
+                    )
+                    st.pyplot(sanity_fig)
+
+        calc_missing = []
+        if not bln_path or not Path(bln_path).exists():
+            calc_missing.append("BLN map")
+        if not str(events_path).strip() or not Path(str(events_path).strip()).expanduser().exists():
+            calc_missing.append("events CSV")
+        if not str(event_pixels_path).strip() or not Path(str(event_pixels_path).strip()).expanduser().exists():
+            calc_missing.append("event pixels CSV")
+        if calc_missing:
+            st.warning("Needed to calculate event intensities: " + ", ".join(calc_missing))
+        else:
+            try:
+                event_stats = load_event_input_stats(
+                    str(Path(str(events_path).strip()).expanduser()),
+                    str(Path(str(event_pixels_path).strip()).expanduser()),
+                    file_cache_signature(str(events_path).strip()),
+                    file_cache_signature(str(event_pixels_path).strip()),
+                )
+            except Exception as exc:
+                st.warning(f"Could not summarize event inputs yet: {exc}")
+            else:
+                st.markdown("**Event Input Stats**")
+                info_cols = st.columns(6)
+                info_cols[0].metric("Events CSV rows", f"{event_stats['events_rows']:,}")
+                info_cols[1].metric("Unique pixel events", f"{event_stats['unique_pixel_events']:,}")
+                info_cols[2].metric("Pixel rows", f"{event_stats['pixel_rows']:,}")
+                info_cols[3].metric("Min pixels/event", f"{event_stats['pixels_per_event_min']:,}")
+                info_cols[4].metric("Median pixels/event", f"{event_stats['pixels_per_event_median']:.0f}")
+                info_cols[5].metric("Max pixels/event", f"{event_stats['pixels_per_event_max']:,}")
+                st.caption(
+                    f"Event-pixel extent: x={event_stats['x_min']}..{event_stats['x_max']}, "
+                    f"y={event_stats['y_min']}..{event_stats['y_max']}."
+                )
+
+        calc_signature = (
+            str(Path(bln_path).expanduser()) if bln_path else "",
+            str(Path(str(events_path).strip()).expanduser()) if str(events_path).strip() else "",
+            str(Path(str(event_pixels_path).strip()).expanduser()) if str(event_pixels_path).strip() else "",
+            file_cache_signature(bln_path) if bln_path else None,
+            file_cache_signature(str(events_path).strip()) if str(events_path).strip() else None,
+            file_cache_signature(str(event_pixels_path).strip()) if str(event_pixels_path).strip() else None,
+        )
+        if st.button(
+            "Calculate and preview event intensities",
+            type="primary",
+            key="slip_intensity_create_run",
+            disabled=bool(calc_missing),
+        ):
+            try:
+                progress = st.progress(0.0, text="Preparing slip-intensity calculation...")
+
+                def intensity_progress(fraction: float, message: str) -> None:
+                    progress.progress(min(1.0, max(0.0, float(fraction))), text=message)
+
+                with st.spinner("Sampling this BLN map at event pixels..."):
+                    result = calculate_event_peak_bln_magnitudes(
+                        calc_signature[0],
+                        calc_signature[1],
+                        calc_signature[2],
+                        progress_callback=intensity_progress,
+                    )
+                progress.progress(1.0, text="Slip-intensity CSV table ready.")
+            except Exception as exc:
+                st.error(f"Slip intensity calculation failed: {exc}")
+            else:
+                st.session_state["last_slip_intensity_create_result"] = result
+                st.session_state["last_slip_intensity_create_signature"] = calc_signature
+
+        result = st.session_state.get("last_slip_intensity_create_result")
+        result_signature = st.session_state.get("last_slip_intensity_create_signature")
+        if result is not None:
+            if result_signature != calc_signature:
+                st.warning("Displayed event-intensity result is from previous files. Recalculate to update.")
+            stats = result["stats"]
+            cols = st.columns(5)
+            cols[0].metric("Events sampled", f"{stats['events_sampled']:,}")
+            cols[1].metric("Event pixels", f"{stats['event_pixels_valid']:,}")
+            cols[2].metric("Slip min nm", f"{stats['slip_intensity_nm_min']:.4g}")
+            cols[3].metric("Slip median nm", f"{stats['slip_intensity_nm_median']:.4g}")
+            cols[4].metric("Slip max nm", f"{stats['slip_intensity_nm_max']:.4g}")
+
+            fig = plot_event_peak_magnitude_distribution(
+                result["event_peak_values"],
+                bins=int(st.slider("Event intensity histogram bins", 10, 200, 60, 5, key="slip_intensity_create_bins")),
+                x_max=float(
+                    st.number_input(
+                        "Event histogram X max",
+                        min_value=0.0,
+                        value=500.0,
+                        step=10.0,
+                        key="slip_intensity_create_xmax",
+                        help="Set to 0 to use the data maximum.",
+                    )
+                )
+                or None,
+                x_label="Slip Intensity (nm)",
+                show_kde=bool(st.checkbox("Show smooth curve", value=True, key="slip_intensity_create_show_kde")),
+            )
+            st.pyplot(fig)
+
+            with st.expander("Per-event slip intensities", expanded=False):
+                st.dataframe(result["event_peak_values"], width="stretch", hide_index=True)
+
+            save_cols = st.columns([1.2, 1])
+            with save_cols[0]:
+                save_prefix = st.text_input(
+                    "Save prefix",
+                    value="slip_intensity",
+                    key="slip_intensity_create_save_prefix",
+                )
+            with save_cols[1]:
+                st.write("")
+                st.write("")
+                if st.button("Save intensity CSV", key="slip_intensity_create_save_csv"):
+                    try:
+                        out_path = save_slip_intensity_values(result, save_prefix)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.success(f"Saved event slip intensities:\n\n{out_path}")
+
+            st.divider()
+            st.markdown("**Blur Sensitivity Check**")
+            st.caption(
+                "Compare event peak intensities before and after a small Gaussian blur. "
+                "This helps reveal whether single-pixel noise is dominating the max-value metric."
+            )
+            blur_cols = st.columns(4)
+            with blur_cols[0]:
+                blur_sigma = st.slider(
+                    "Gaussian sigma",
+                    0.1,
+                    5.0,
+                    1.0,
+                    0.1,
+                    key="slip_intensity_blur_sigma",
+                    help="Standard deviation of the Gaussian blur in pixels.",
+                )
+            with blur_cols[1]:
+                inspect_top_n = st.slider(
+                    "Largest events to inspect",
+                    1,
+                    20,
+                    5,
+                    1,
+                    key="slip_intensity_blur_top_n",
+                    help="Ranks events by pixel count and plots detailed raw-vs-blurred pixel distributions for the largest events.",
+                )
+            with blur_cols[2]:
+                blur_bins = st.slider(
+                    "Blur histogram bins",
+                    10,
+                    200,
+                    60,
+                    5,
+                    key="slip_intensity_blur_bins",
+                )
+            with blur_cols[3]:
+                blur_x_max = st.number_input(
+                    "Blur histogram X max",
+                    min_value=0.0,
+                    value=500.0,
+                    step=10.0,
+                    key="slip_intensity_blur_xmax",
+                    help="Set to 0 to use the data maximum.",
+                )
+
+            blur_signature = (
+                calc_signature,
+                float(blur_sigma),
+                int(inspect_top_n),
+            )
+            if st.button("Run blur sensitivity check", key="slip_intensity_blur_run"):
+                try:
+                    blur_progress = st.progress(0.0, text="Preparing blur sensitivity check...")
+
+                    def blur_progress_callback(fraction: float, message: str) -> None:
+                        blur_progress.progress(min(1.0, max(0.0, float(fraction))), text=message)
+
+                    blur_result = calculate_blur_sensitivity_for_events(
+                        calc_signature[0],
+                        calc_signature[1],
+                        calc_signature[2],
+                        sigma=float(blur_sigma),
+                        top_n=int(inspect_top_n),
+                        progress_callback=blur_progress_callback,
+                    )
+                    blur_progress.progress(1.0, text="Blur sensitivity check ready.")
+                except Exception as exc:
+                    st.error(f"Blur sensitivity check failed: {exc}")
+                else:
+                    st.session_state["last_slip_intensity_blur_result"] = blur_result
+                    st.session_state["last_slip_intensity_blur_signature"] = blur_signature
+
+            blur_result = st.session_state.get("last_slip_intensity_blur_result")
+            last_blur_signature = st.session_state.get("last_slip_intensity_blur_signature")
+            if blur_result is not None:
+                if last_blur_signature != blur_signature:
+                    st.warning("Displayed blur sensitivity result is from previous settings. Run the check again to update.")
+                blur_stats = blur_result["stats"]
+                blur_metric_cols = st.columns(5)
+                blur_metric_cols[0].metric("Events checked", f"{blur_stats['events_checked']:,}")
+                blur_metric_cols[1].metric("Median raw max nm", f"{blur_stats['raw_peak_median_nm']:.4g}")
+                blur_metric_cols[2].metric("Median blurred max nm", f"{blur_stats['blurred_peak_median_nm']:.4g}")
+                blur_metric_cols[3].metric("Median change nm", f"{blur_stats['median_delta_nm']:.4g}")
+                blur_metric_cols[4].metric(">10% reduced", f"{blur_stats['events_reduced_over_10pct']:,}")
+
+                st.pyplot(
+                    plot_blur_peak_distribution(
+                        blur_result["event_peak_comparison"],
+                        bins=int(blur_bins),
+                        x_max=float(blur_x_max) if float(blur_x_max) > 0 else None,
+                    )
+                )
+
+                with st.expander("Raw vs blurred peak table", expanded=False):
+                    st.dataframe(blur_result["event_peak_comparison"], width="stretch", hide_index=True)
+
+                st.markdown("**Largest Event Pixel-Value Distributions**")
+                for event_detail in blur_result["top_event_distributions"]:
+                    st.pyplot(
+                        plot_single_event_blur_distribution(
+                            event_detail,
+                            bins=int(blur_bins),
+                            x_max=float(blur_x_max) if float(blur_x_max) > 0 else None,
+                        )
+                    )
+
+    with plot_tab:
+        st.markdown("**Recreate Figure 3a From Saved Intensity CSVs**")
+        st.caption(
+            "Load the CSVs created in the first subtab. Each CSV should include "
+            "`peak_slip_intensity_nm`; older files with `peak_bln_magnitude` are converted automatically."
+        )
+        dataset_count = st.slider(
+            "Number of distributions",
+            1,
+            5,
+            3,
+            1,
+            key="slip_intensity_plot_dataset_count",
+        )
+        default_labels = ["1.2%", "2.1%", "4.3%", "Dataset 4", "Dataset 5"]
+        csv_inputs: list[dict] = []
+        for idx in range(int(dataset_count)):
+            row = st.columns([0.8, 2.2])
+            with row[0]:
+                label = st.text_input(
+                    "Label",
+                    value=default_labels[idx],
+                    key=f"slip_intensity_plot_label_{idx}",
+                )
+            with row[1]:
+                csv_path = st.text_input(
+                    "Slip intensity CSV path",
+                    key=f"slip_intensity_plot_csv_path_{idx}",
+                    help="CSV created by the Create Intensity CSV subtab.",
+                )
+            csv_inputs.append({"label": str(label).strip() or f"Dataset {idx + 1}", "csv_path": str(csv_path).strip()})
+
+        st.markdown("**Plot Style**")
+        style_cols = st.columns(4)
+        with style_cols[0]:
+            rt_style = st.checkbox(
+                "Match RT script style",
+                value=True,
+                key="slip_intensity_plot_rt_style",
+                help="Uses density normalization, 45 bins, KDE, and auto x-limit from the 99.5th percentile.",
+            )
+        with style_cols[1]:
+            y_mode = st.selectbox(
+                "Y-axis mode",
+                ["density", "fraction", "count"],
+                index=0 if rt_style else 1,
+                key="slip_intensity_plot_y_mode",
+                help=(
+                    "density matches the RT script's seaborn stat='density'. "
+                    "fraction makes bar heights sum to 1. count shows raw event counts."
+                ),
+            )
+        with style_cols[2]:
+            auto_x_quantile = st.number_input(
+                "Auto X percentile",
+                min_value=50.0,
+                max_value=100.0,
+                value=99.5,
+                step=0.1,
+                key="slip_intensity_plot_auto_x_quantile",
+                help="When X max is 0, use this percentile across all loaded distributions.",
+            )
+        with style_cols[3]:
+            kde_bw_adjust = st.slider(
+                "KDE bandwidth",
+                0.2,
+                3.0,
+                1.2,
+                0.1,
+                key="slip_intensity_plot_kde_bw",
+                help="Matches the RT script default of 1.2.",
+            )
+
+        controls = st.columns(5)
+        with controls[0]:
+            bins = st.slider(
+                "Histogram bins",
+                10,
+                200,
+                45 if rt_style else 60,
+                5,
+                key="slip_intensity_plot_bins",
+            )
+        with controls[1]:
+            x_max_input = st.number_input(
+                "X max",
+                min_value=0.0,
+                value=0.0 if rt_style else 500.0,
+                step=10.0,
+                key="slip_intensity_plot_xmax",
+                help="Set to 0 to use the selected auto percentile across all loaded distributions.",
+            )
+        with controls[2]:
+            x_label = st.text_input(
+                "X-axis label",
+                value="Slip Intensity (nm)",
+                key="slip_intensity_plot_xlabel",
+            )
+        with controls[3]:
+            show_kde = st.checkbox(
+                "Show smooth curve",
+                value=True if rt_style else True,
+                key="slip_intensity_plot_show_kde",
+            )
+        with controls[4]:
+            figure3_style = st.checkbox(
+                "Figure 3a style",
+                value=True,
+                key="slip_intensity_plot_figure3_style",
+            )
+
+        missing = [item["label"] for item in csv_inputs if not item["csv_path"] or not Path(item["csv_path"]).expanduser().exists()]
+        if missing:
+            st.info("Enter valid saved intensity CSV paths for each distribution.")
+            if any(item["csv_path"] for item in csv_inputs):
+                st.warning("Missing CSV for: " + ", ".join(missing))
+            return
+
+        plot_signature = tuple(
+            (
+                item["label"],
+                str(Path(item["csv_path"]).expanduser()),
+                file_cache_signature(item["csv_path"]),
+            )
+            for item in csv_inputs
+        )
+        if st.button("Plot saved distributions", type="primary", key="slip_intensity_plot_run"):
+            try:
+                series = []
+                for item in csv_inputs:
+                    frame = read_slip_intensity_values_csv(str(Path(item["csv_path"]).expanduser()), item["label"])
+                    series.append(
+                        {
+                            "label": item["label"],
+                            "event_peak_values": frame,
+                            "stats": slip_intensity_frame_stats(frame),
+                        }
+                    )
+            except Exception as exc:
+                st.error(f"Could not load slip-intensity CSVs: {exc}")
+            else:
+                st.session_state["last_slip_intensity_plot_result"] = {"series": series}
+                st.session_state["last_slip_intensity_plot_signature"] = plot_signature
+
+        plot_result = st.session_state.get("last_slip_intensity_plot_result")
+        result_signature = st.session_state.get("last_slip_intensity_plot_signature")
+        if plot_result is None:
+            st.info("Press Plot saved distributions after adding the CSV paths.")
+            return
+        if result_signature != plot_signature:
+            st.warning("Displayed histogram is from previous CSVs. Plot again to update.")
+
+        summary_rows = []
+        for item in plot_result["series"]:
+            stats = item["stats"]
+            summary_rows.append(
+                {
+                    "label": item["label"],
+                    "events_sampled": stats["events_sampled"],
+                    "slip_intensity_nm_min": stats["slip_intensity_nm_min"],
+                    "slip_intensity_nm_median": stats["slip_intensity_nm_median"],
+                    "slip_intensity_nm_mean": stats["slip_intensity_nm_mean"],
+                    "slip_intensity_nm_max": stats["slip_intensity_nm_max"],
+                }
+            )
+        st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+        fig = plot_multi_event_peak_magnitude_distribution(
+            plot_result["series"],
+            bins=int(bins),
+            x_max=float(x_max_input) if float(x_max_input) > 0 else None,
+            x_label=x_label,
+            show_kde=bool(show_kde),
+            figure3_style=bool(figure3_style),
+            y_mode=str(y_mode),
+            auto_x_percentile=float(auto_x_quantile),
+            kde_bw_adjust=float(kde_bw_adjust),
+            rt_style=bool(rt_style),
+        )
+        st.pyplot(fig)
+
+
 def manual_boundary_cut_tab() -> None:
     st.markdown("**Manual Cut From Saved CSVs**")
     col1, col2 = st.columns(2)
@@ -3131,16 +3850,17 @@ def manual_boundary_cut_tab() -> None:
 
 
 def auto_boundary_cut_tab() -> None:
-    st.markdown("**Auto Cut From Current Hough Detection**")
+    st.markdown("**Auto Cut From Current Detection**")
     st.caption(
-        "Uses the current Hough-traced events and the exact processing crop from the Detection Results tab. "
-        "Run Hough Step 1 and Step 2 first."
+        "Uses the current traced events and the exact processing crop from the Detection Results tab. "
+        "Run Hough Step 2 or build Trial Mask Events first."
     )
 
     stored_result = st.session_state.get("last_pipeline_result")
     stored_params = st.session_state.get("last_pipeline_params")
-    if stored_result is None or "hough_events" not in stored_result:
-        st.info("Run Detection Results > Hough Line Detection > Step 2 first, then return here.")
+    current_detection = current_traced_detection_result(stored_result)
+    if stored_result is None or current_detection is None:
+        st.info("Run Detection Results > Hough Line Detection > Step 2 or Trial Mask Events > Build mask events first, then return here.")
         return
 
     crop = stored_result["crop"]
@@ -3151,7 +3871,8 @@ def auto_boundary_cut_tab() -> None:
     cols[1].metric("Crop Y", crop_y)
     cols[2].metric("Width", crop_w)
     cols[3].metric("Height", crop_h)
-    cols[4].metric("Events", stored_result["hough_events"]["accepted_count"])
+    cols[4].metric("Events", current_detection["events"]["accepted_count"])
+    st.caption(f"Current detection source: {current_detection['label']}")
 
     boundary_path = st.text_input(
         "EBSD boundary map",
@@ -3268,8 +3989,8 @@ def auto_boundary_cut_tab() -> None:
 
     if run_clicked:
         try:
-            with st.spinner("Cutting current Hough events against EBSD boundary crop..."):
-                event_pixels, events = hough_result_to_boundary_cut_frames(stored_result, stored_params)
+            with st.spinner("Cutting current traced events against EBSD boundary crop..."):
+                event_pixels, events = detection_result_to_boundary_cut_frames(stored_result, stored_params)
                 display_crop = {
                     "x": int(crop_x),
                     "y": int(crop_y),
@@ -3298,7 +4019,7 @@ def auto_boundary_cut_tab() -> None:
     result = st.session_state.get("last_auto_boundary_cut_result")
     stored_signature = st.session_state.get("last_auto_boundary_cut_signature")
     if result is None:
-        st.info("Press Run auto boundary cut to cut the current Hough-traced events.")
+        st.info("Press Run auto boundary cut to cut the current traced events.")
         return
     if stored_signature != signature:
         st.warning("Displayed auto boundary-cut result is from previous inputs or parameters. Press Run auto boundary cut to update.")
@@ -3577,12 +4298,33 @@ def run_boundary_cut_from_frames(
     }
 
 
-def hough_result_to_boundary_cut_frames(
+def current_traced_detection_result(result: dict | None) -> dict | None:
+    if not result:
+        return None
+    if "mask_events" in result:
+        return {
+            "key": "mask_events",
+            "method": "mask_band_component",
+            "label": "Trial Mask Events",
+            "events": result["mask_events"],
+        }
+    if "hough_events" in result:
+        return {
+            "key": "hough_events",
+            "method": "hough",
+            "label": "Hough Line Detection",
+            "events": result["hough_events"],
+        }
+    return None
+
+
+def detection_result_to_boundary_cut_frames(
     result: dict,
     params: PipelineParams | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if "hough_events" not in result:
-        raise ValueError("No Hough events found. Run Hough Step 2 first.")
+    current_detection = current_traced_detection_result(result)
+    if current_detection is None:
+        raise ValueError("No traced events found. Run Hough Step 2 or Trial event tracing first.")
 
     crop = result["crop"]
     crop_x, crop_y = crop["origin"]
@@ -3591,8 +4333,10 @@ def hough_result_to_boundary_cut_frames(
     pixel_rows = []
     event_rows = []
 
-    for index, line in enumerate(result["hough_events"]["accepted"], start=1):
-        event_id = f"auto_hough_{index:04d}"
+    method = current_detection["method"]
+    event_prefix = "auto_mask" if method == "mask_band_component" else "auto_hough"
+    for index, line in enumerate(current_detection["events"]["accepted"], start=1):
+        event_id = f"{event_prefix}_{index:04d}"
         points = sorted(line.points, key=lambda point: (point.y, point.x))
         global_points = [(int(crop_x + point.x), int(crop_y + point.y)) for point in points]
         if not global_points:
@@ -3600,7 +4344,7 @@ def hough_result_to_boundary_cut_frames(
         event_rows.append(
             {
                 "event_id": event_id,
-                "method": "hough",
+                "method": method,
                 "num_pixels": len(global_points),
                 "crop_x": int(crop_x),
                 "crop_y": int(crop_y),
@@ -4622,6 +5366,733 @@ def event_pixel_points(frame: pd.DataFrame) -> set[tuple[int, int]]:
     xs = frame["pixel_x"].to_numpy(dtype=np.int64)
     ys = frame["pixel_y"].to_numpy(dtype=np.int64)
     return set(zip(xs.tolist(), ys.tolist(), strict=False))
+
+
+@st.cache_data(show_spinner=False)
+def load_bln_sanity_preview(bln_path: str, max_dim: int) -> dict:
+    with Image.open(bln_path) as img:
+        original_width, original_height = img.size
+        preview = img.copy()
+        preview.thumbnail((int(max_dim), int(max_dim)), Image.Resampling.BILINEAR)
+        arr = np.asarray(preview).copy()
+
+    values = np.squeeze(arr)
+    if values.ndim == 3:
+        values = values[..., :3].astype(np.float32).mean(axis=2)
+    else:
+        values = values.astype(np.float32, copy=False)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        finite = np.array([0.0], dtype=np.float32)
+    stats = {
+        "min": float(np.min(finite)),
+        "p1": float(np.percentile(finite, 1)),
+        "median": float(np.median(finite)),
+        "p99": float(np.percentile(finite, 99)),
+        "max": float(np.max(finite)),
+    }
+    return {
+        "original_width": int(original_width),
+        "original_height": int(original_height),
+        "preview_width": int(values.shape[1]),
+        "preview_height": int(values.shape[0]),
+        "preview_rgb": normalize_to_uint8_rgb(values),
+        "values": values.astype(np.float32),
+        "stats": stats,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_bln_full_resolution_values(bln_path: str) -> dict:
+    with Image.open(bln_path) as img:
+        arr = np.asarray(img).copy()
+    values = np.squeeze(arr)
+    if values.ndim == 3:
+        values = values[..., :3].astype(np.float32).mean(axis=2)
+    else:
+        values = values.astype(np.float32, copy=False)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        finite = np.array([0.0], dtype=np.float32)
+    stats = {
+        "min": float(np.min(finite)),
+        "p1": float(np.percentile(finite, 1)),
+        "median": float(np.median(finite)),
+        "p99": float(np.percentile(finite, 99)),
+        "max": float(np.max(finite)),
+    }
+    return {"values": values.astype(np.float32), "stats": stats}
+
+
+def plot_bln_value_distribution(values: np.ndarray, bins: int, absolute_values: bool, title: str):
+    import matplotlib.pyplot as plt
+
+    data = np.asarray(values, dtype=np.float64).ravel()
+    data = data[np.isfinite(data)]
+    if absolute_values:
+        data = np.abs(data)
+    data = data * BLN_TO_NM_SCALE
+    if data.size == 0:
+        data = np.array([0.0], dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5), dpi=140)
+    weights = np.ones(data.shape, dtype=np.float64) / max(1, data.size)
+    ax.hist(
+        data,
+        bins=int(bins),
+        weights=weights,
+        color="#b9d7e5",
+        edgecolor="#303030",
+        linewidth=0.7,
+        alpha=0.8,
+    )
+    ax.set_xlabel("Slip Intensity (nm)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Normalized Frequency", fontsize=12, fontweight="bold")
+    ax.set_title(title, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+@st.cache_data(show_spinner=False)
+def load_event_input_stats(
+    events_path: str,
+    event_pixels_path: str,
+    events_signature: tuple,
+    pixels_signature: tuple,
+) -> dict:
+    del events_signature, pixels_signature
+    events = pd.read_csv(events_path)
+    event_pixels = pd.read_csv(event_pixels_path)
+    required = {"event_id", "pixel_x", "pixel_y"}
+    if not required.issubset(event_pixels.columns):
+        raise ValueError(f"Event pixels CSV must include columns: {sorted(required)}")
+
+    pixels = event_pixels[["event_id", "pixel_x", "pixel_y"]].copy()
+    pixels["event_id"] = pixels["event_id"].astype(str)
+    pixels["pixel_x"] = pd.to_numeric(pixels["pixel_x"], errors="coerce")
+    pixels["pixel_y"] = pd.to_numeric(pixels["pixel_y"], errors="coerce")
+    pixels = pixels.dropna(subset=["pixel_x", "pixel_y"]).copy()
+    if pixels.empty:
+        raise ValueError("Event pixels CSV has no valid pixel coordinates.")
+
+    pixels["pixel_x"] = pixels["pixel_x"].round().astype(np.int64)
+    pixels["pixel_y"] = pixels["pixel_y"].round().astype(np.int64)
+    sizes = pixels.groupby("event_id", sort=False).size()
+    return {
+        "events_rows": int(len(events)),
+        "unique_pixel_events": int(sizes.size),
+        "pixel_rows": int(len(pixels)),
+        "pixels_per_event_min": int(sizes.min()) if sizes.size else 0,
+        "pixels_per_event_median": float(sizes.median()) if sizes.size else 0.0,
+        "pixels_per_event_mean": float(sizes.mean()) if sizes.size else 0.0,
+        "pixels_per_event_max": int(sizes.max()) if sizes.size else 0,
+        "x_min": int(pixels["pixel_x"].min()),
+        "x_max": int(pixels["pixel_x"].max()),
+        "y_min": int(pixels["pixel_y"].min()),
+        "y_max": int(pixels["pixel_y"].max()),
+    }
+
+
+def calculate_event_peak_bln_magnitudes(
+    bln_path: str,
+    events_path: str,
+    event_pixels_path: str,
+    progress_callback=None,
+) -> dict:
+    if progress_callback is not None:
+        progress_callback(0.05, "Reading event-pixel CSV...")
+    event_pixels = pd.read_csv(event_pixels_path)
+    required = {"event_id", "pixel_x", "pixel_y"}
+    if not required.issubset(event_pixels.columns):
+        raise ValueError(f"Event pixels CSV must include columns: {sorted(required)}")
+
+    if progress_callback is not None:
+        progress_callback(0.15, "Cleaning event coordinates...")
+    event_pixels = event_pixels[["event_id", "pixel_x", "pixel_y"]].copy()
+    event_pixels["event_id"] = event_pixels["event_id"].astype(str)
+    event_pixels["pixel_x"] = pd.to_numeric(event_pixels["pixel_x"], errors="coerce")
+    event_pixels["pixel_y"] = pd.to_numeric(event_pixels["pixel_y"], errors="coerce")
+    event_pixels = event_pixels.dropna(subset=["pixel_x", "pixel_y"]).copy()
+    if event_pixels.empty:
+        raise ValueError("Event pixels CSV has no valid pixel coordinates.")
+    event_pixels["pixel_x"] = event_pixels["pixel_x"].round().astype(np.int64)
+    event_pixels["pixel_y"] = event_pixels["pixel_y"].round().astype(np.int64)
+
+    if progress_callback is not None:
+        progress_callback(0.25, "Finding event extent inside the BLN map...")
+    img_w, img_h = image_size(bln_path)
+    x_min = max(0, int(event_pixels["pixel_x"].min()))
+    y_min = max(0, int(event_pixels["pixel_y"].min()))
+    x_max = min(img_w - 1, int(event_pixels["pixel_x"].max()))
+    y_max = min(img_h - 1, int(event_pixels["pixel_y"].max()))
+    if x_max < x_min or y_max < y_min:
+        raise ValueError("Event-pixel extent does not overlap the BLN image.")
+
+    width = x_max - x_min + 1
+    height = y_max - y_min + 1
+    if progress_callback is not None:
+        progress_callback(0.35, "Loading BLN crop that covers the event pixels...")
+    with Image.open(bln_path) as img:
+        crop_arr = np.asarray(img.crop((x_min, y_min, x_max + 1, y_max + 1))).copy()
+    crop_arr = np.squeeze(crop_arr)
+    if crop_arr.ndim == 3:
+        crop_values = crop_arr[..., :3].astype(np.float32).mean(axis=2)
+    else:
+        crop_values = crop_arr.astype(np.float32, copy=False)
+    crop_values = np.nan_to_num(crop_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    xs = event_pixels["pixel_x"].to_numpy(dtype=np.int64)
+    ys = event_pixels["pixel_y"].to_numpy(dtype=np.int64)
+    valid = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+    valid_pixels = event_pixels.loc[valid].copy()
+    if valid_pixels.empty:
+        raise ValueError("No event pixels fall inside the BLN image extent.")
+
+    if progress_callback is not None:
+        progress_callback(0.55, "Sampling BLN values at event pixels...")
+    local_x = valid_pixels["pixel_x"].to_numpy(dtype=np.int64) - x_min
+    local_y = valid_pixels["pixel_y"].to_numpy(dtype=np.int64) - y_min
+    values = crop_values[local_y, local_x].astype(np.float64)
+    valid_pixels["bln_value"] = values
+    valid_pixels["bln_magnitude"] = np.abs(values)
+
+    if progress_callback is not None:
+        progress_callback(0.70, "Finding each event's maximum BLN magnitude...")
+    idx = valid_pixels.groupby("event_id", sort=False)["bln_magnitude"].idxmax()
+    peak_values = valid_pixels.loc[idx, ["event_id", "pixel_x", "pixel_y", "bln_value", "bln_magnitude"]].copy()
+    peak_values = peak_values.rename(
+        columns={
+            "pixel_x": "peak_pixel_x",
+            "pixel_y": "peak_pixel_y",
+            "bln_value": "peak_bln_value",
+            "bln_magnitude": "peak_bln_magnitude",
+        }
+    )
+    pixel_counts = valid_pixels.groupby("event_id", sort=False).size().rename("event_pixel_count")
+    peak_values = peak_values.merge(pixel_counts, on="event_id", how="left")
+    peak_values["peak_slip_intensity_nm"] = peak_values["peak_bln_magnitude"].astype(np.float64) * BLN_TO_NM_SCALE
+
+    if progress_callback is not None:
+        progress_callback(0.82, "Merging optional event metadata...")
+    events = pd.read_csv(events_path)
+    if "event_id" in events.columns:
+        event_meta = events.drop_duplicates(subset=["event_id"]).copy()
+        event_meta["event_id"] = event_meta["event_id"].astype(str)
+        keep_meta_cols = [
+            col
+            for col in ["event_id", "method", "num_pixels", "original_event_id", "cut_index", "event_type", "classification"]
+            if col in event_meta.columns
+        ]
+        if len(keep_meta_cols) > 1:
+            peak_values = peak_values.merge(event_meta[keep_meta_cols], on="event_id", how="left")
+
+    if progress_callback is not None:
+        progress_callback(0.92, "Calculating slip-intensity summary...")
+    magnitudes = peak_values["peak_bln_magnitude"].to_numpy(dtype=np.float64)
+    slip_intensity_nm = peak_values["peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    stats = {
+        "events_sampled": int(len(peak_values)),
+        "event_pixels_valid": int(len(valid_pixels)),
+        "event_pixels_input_rows": int(len(event_pixels)),
+        "peak_magnitude_min": float(np.min(magnitudes)) if len(magnitudes) else 0.0,
+        "peak_magnitude_median": float(np.median(magnitudes)) if len(magnitudes) else 0.0,
+        "peak_magnitude_mean": float(np.mean(magnitudes)) if len(magnitudes) else 0.0,
+        "peak_magnitude_max": float(np.max(magnitudes)) if len(magnitudes) else 0.0,
+        "slip_intensity_nm_min": float(np.min(slip_intensity_nm)) if len(slip_intensity_nm) else 0.0,
+        "slip_intensity_nm_median": float(np.median(slip_intensity_nm)) if len(slip_intensity_nm) else 0.0,
+        "slip_intensity_nm_mean": float(np.mean(slip_intensity_nm)) if len(slip_intensity_nm) else 0.0,
+        "slip_intensity_nm_max": float(np.max(slip_intensity_nm)) if len(slip_intensity_nm) else 0.0,
+        "bln_to_nm_scale": float(BLN_TO_NM_SCALE),
+    }
+    if progress_callback is not None:
+        progress_callback(0.98, "Finalizing event intensity table...")
+    return {
+        "bln_path": str(bln_path),
+        "events_path": str(events_path),
+        "event_pixels_path": str(event_pixels_path),
+        "crop": {
+            "x_min": int(x_min),
+            "y_min": int(y_min),
+            "x_max": int(x_max),
+            "y_max": int(y_max),
+            "width": int(width),
+            "height": int(height),
+        },
+        "stats": stats,
+        "event_peak_values": peak_values.sort_values("event_id").reset_index(drop=True),
+    }
+
+
+def load_event_pixels_and_bln_crop(
+    bln_path: str,
+    event_pixels_path: str,
+    progress_callback=None,
+) -> tuple[pd.DataFrame, np.ndarray, dict]:
+    if progress_callback is not None:
+        progress_callback(0.05, "Reading event pixels...")
+    event_pixels = pd.read_csv(event_pixels_path)
+    required = {"event_id", "pixel_x", "pixel_y"}
+    if not required.issubset(event_pixels.columns):
+        raise ValueError(f"Event pixels CSV must include columns: {sorted(required)}")
+
+    event_pixels = event_pixels[["event_id", "pixel_x", "pixel_y"]].copy()
+    event_pixels["event_id"] = event_pixels["event_id"].astype(str)
+    event_pixels["pixel_x"] = pd.to_numeric(event_pixels["pixel_x"], errors="coerce")
+    event_pixels["pixel_y"] = pd.to_numeric(event_pixels["pixel_y"], errors="coerce")
+    event_pixels = event_pixels.dropna(subset=["pixel_x", "pixel_y"]).copy()
+    if event_pixels.empty:
+        raise ValueError("Event pixels CSV has no valid pixel coordinates.")
+    event_pixels["pixel_x"] = event_pixels["pixel_x"].round().astype(np.int64)
+    event_pixels["pixel_y"] = event_pixels["pixel_y"].round().astype(np.int64)
+
+    if progress_callback is not None:
+        progress_callback(0.20, "Finding BLN crop extent...")
+    img_w, img_h = image_size(bln_path)
+    x_min = max(0, int(event_pixels["pixel_x"].min()))
+    y_min = max(0, int(event_pixels["pixel_y"].min()))
+    x_max = min(img_w - 1, int(event_pixels["pixel_x"].max()))
+    y_max = min(img_h - 1, int(event_pixels["pixel_y"].max()))
+    if x_max < x_min or y_max < y_min:
+        raise ValueError("Event-pixel extent does not overlap the BLN image.")
+
+    if progress_callback is not None:
+        progress_callback(0.35, "Loading BLN crop...")
+    with Image.open(bln_path) as img:
+        crop_arr = np.asarray(img.crop((x_min, y_min, x_max + 1, y_max + 1))).copy()
+    crop_arr = np.squeeze(crop_arr)
+    if crop_arr.ndim == 3:
+        crop_values = crop_arr[..., :3].astype(np.float32).mean(axis=2)
+    else:
+        crop_values = crop_arr.astype(np.float32, copy=False)
+    crop_values = np.nan_to_num(crop_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+    xs = event_pixels["pixel_x"].to_numpy(dtype=np.int64)
+    ys = event_pixels["pixel_y"].to_numpy(dtype=np.int64)
+    valid = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+    valid_pixels = event_pixels.loc[valid].copy()
+    if valid_pixels.empty:
+        raise ValueError("No event pixels fall inside the BLN image extent.")
+
+    crop = {
+        "x_min": int(x_min),
+        "y_min": int(y_min),
+        "x_max": int(x_max),
+        "y_max": int(y_max),
+        "width": int(x_max - x_min + 1),
+        "height": int(y_max - y_min + 1),
+    }
+    return valid_pixels.reset_index(drop=True), crop_values, crop
+
+
+def calculate_blur_sensitivity_for_events(
+    bln_path: str,
+    events_path: str,
+    event_pixels_path: str,
+    sigma: float,
+    top_n: int,
+    progress_callback=None,
+) -> dict:
+    del events_path
+    valid_pixels, crop_values, crop = load_event_pixels_and_bln_crop(
+        bln_path,
+        event_pixels_path,
+        progress_callback=progress_callback,
+    )
+    if progress_callback is not None:
+        progress_callback(0.45, f"Applying Gaussian blur, sigma={float(sigma):.2f}...")
+    blurred_values = ndi.gaussian_filter(crop_values.astype(np.float32, copy=False), sigma=float(sigma))
+
+    if progress_callback is not None:
+        progress_callback(0.58, "Sampling raw and blurred BLN values...")
+    local_x = valid_pixels["pixel_x"].to_numpy(dtype=np.int64) - crop["x_min"]
+    local_y = valid_pixels["pixel_y"].to_numpy(dtype=np.int64) - crop["y_min"]
+    valid_pixels["raw_bln_value"] = crop_values[local_y, local_x].astype(np.float64)
+    valid_pixels["blurred_bln_value"] = blurred_values[local_y, local_x].astype(np.float64)
+    valid_pixels["raw_slip_intensity_nm"] = np.abs(valid_pixels["raw_bln_value"].to_numpy(dtype=np.float64)) * BLN_TO_NM_SCALE
+    valid_pixels["blurred_slip_intensity_nm"] = (
+        np.abs(valid_pixels["blurred_bln_value"].to_numpy(dtype=np.float64)) * BLN_TO_NM_SCALE
+    )
+
+    if progress_callback is not None:
+        progress_callback(0.72, "Computing per-event raw and blurred maxima...")
+    grouped = valid_pixels.groupby("event_id", sort=False)
+    raw_idx = grouped["raw_slip_intensity_nm"].idxmax()
+    blurred_idx = grouped["blurred_slip_intensity_nm"].idxmax()
+    raw_peak = valid_pixels.loc[raw_idx, ["event_id", "pixel_x", "pixel_y", "raw_slip_intensity_nm"]].copy()
+    raw_peak = raw_peak.rename(
+        columns={
+            "pixel_x": "raw_peak_pixel_x",
+            "pixel_y": "raw_peak_pixel_y",
+            "raw_slip_intensity_nm": "raw_peak_slip_intensity_nm",
+        }
+    )
+    blurred_peak = valid_pixels.loc[blurred_idx, ["event_id", "pixel_x", "pixel_y", "blurred_slip_intensity_nm"]].copy()
+    blurred_peak = blurred_peak.rename(
+        columns={
+            "pixel_x": "blurred_peak_pixel_x",
+            "pixel_y": "blurred_peak_pixel_y",
+            "blurred_slip_intensity_nm": "blurred_peak_slip_intensity_nm",
+        }
+    )
+    pixel_counts = grouped.size().rename("event_pixel_count")
+    comparison = raw_peak.merge(blurred_peak, on="event_id", how="inner").merge(pixel_counts, on="event_id", how="left")
+    comparison["delta_nm"] = comparison["blurred_peak_slip_intensity_nm"] - comparison["raw_peak_slip_intensity_nm"]
+    comparison["percent_change"] = np.where(
+        comparison["raw_peak_slip_intensity_nm"] > 0,
+        100.0 * comparison["delta_nm"] / comparison["raw_peak_slip_intensity_nm"],
+        np.nan,
+    )
+    comparison = comparison.sort_values("event_pixel_count", ascending=False).reset_index(drop=True)
+
+    if progress_callback is not None:
+        progress_callback(0.86, f"Preparing top {int(top_n)} event pixel distributions...")
+    top_event_ids = comparison.head(int(top_n))["event_id"].astype(str).tolist()
+    top_event_distributions = []
+    for event_id in top_event_ids:
+        group = valid_pixels.loc[valid_pixels["event_id"].astype(str) == event_id]
+        top_event_distributions.append(
+            {
+                "event_id": event_id,
+                "event_pixel_count": int(len(group)),
+                "raw_values_nm": group["raw_slip_intensity_nm"].to_numpy(dtype=np.float64),
+                "blurred_values_nm": group["blurred_slip_intensity_nm"].to_numpy(dtype=np.float64),
+            }
+        )
+
+    raw_values = comparison["raw_peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    blurred_values = comparison["blurred_peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    delta_values = comparison["delta_nm"].to_numpy(dtype=np.float64)
+    percent_change = comparison["percent_change"].to_numpy(dtype=np.float64)
+    stats = {
+        "events_checked": int(len(comparison)),
+        "raw_peak_median_nm": float(np.nanmedian(raw_values)) if len(raw_values) else 0.0,
+        "blurred_peak_median_nm": float(np.nanmedian(blurred_values)) if len(blurred_values) else 0.0,
+        "median_delta_nm": float(np.nanmedian(delta_values)) if len(delta_values) else 0.0,
+        "median_percent_change": float(np.nanmedian(percent_change)) if len(percent_change) else 0.0,
+        "events_reduced_over_10pct": int(np.sum(percent_change <= -10.0)) if len(percent_change) else 0,
+        "sigma": float(sigma),
+    }
+    if progress_callback is not None:
+        progress_callback(0.98, "Finalizing blur sensitivity result...")
+    return {
+        "crop": crop,
+        "stats": stats,
+        "event_peak_comparison": comparison,
+        "top_event_distributions": top_event_distributions,
+    }
+
+
+def plot_blur_peak_distribution(comparison: pd.DataFrame, bins: int, x_max: float | None):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    raw = comparison["raw_peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    blurred = comparison["blurred_peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    raw = raw[np.isfinite(raw)]
+    blurred = blurred[np.isfinite(blurred)]
+    if raw.size == 0 or blurred.size == 0:
+        raise ValueError("No finite raw/blurred peak values are available for plotting.")
+    upper = float(x_max) if x_max is not None and x_max > 0 else float(max(raw.max(), blurred.max()))
+    upper = max(upper, 1.0)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8), dpi=140)
+    for values, color, label in [
+        (raw, "#1f77b4", "Raw max"),
+        (blurred, "#d55e00", "Blurred max"),
+    ]:
+        weights = np.ones(values.shape, dtype=np.float64) / max(1, values.size)
+        ax.hist(
+            values,
+            bins=int(bins),
+            range=(0.0, upper),
+            weights=weights,
+            color=color,
+            edgecolor="#202020",
+            linewidth=0.7,
+            alpha=0.32,
+        )
+        if values.size >= 3 and np.unique(values).size >= 2:
+            try:
+                from scipy.stats import gaussian_kde
+
+                xs = np.linspace(0.0, upper, 400)
+                kde = gaussian_kde(values)
+                bin_width = upper / max(1, int(bins))
+                ax.plot(xs, kde(xs) * bin_width, color=color, linewidth=2.0)
+            except Exception:
+                pass
+    ax.legend(
+        handles=[
+            Line2D([0], [0], color="#1f77b4", linewidth=2.0, label="Raw max"),
+            Line2D([0], [0], color="#d55e00", linewidth=2.0, label="Blurred max"),
+        ],
+        frameon=True,
+    )
+    ax.set_xlim(0.0, upper)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("Slip Intensity (nm)", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Normalized Frequency", fontsize=13, fontweight="bold")
+    ax.set_title("All Events: Raw vs Gaussian-Blurred Peak Intensity", fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def plot_single_event_blur_distribution(event_detail: dict, bins: int, x_max: float | None):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    raw = np.asarray(event_detail["raw_values_nm"], dtype=np.float64)
+    blurred = np.asarray(event_detail["blurred_values_nm"], dtype=np.float64)
+    raw = raw[np.isfinite(raw)]
+    blurred = blurred[np.isfinite(blurred)]
+    if raw.size == 0 or blurred.size == 0:
+        raise ValueError(f"Event {event_detail['event_id']} has no finite values.")
+    upper = float(x_max) if x_max is not None and x_max > 0 else float(max(raw.max(), blurred.max()))
+    upper = max(upper, 1.0)
+
+    fig, ax = plt.subplots(figsize=(7.0, 3.8), dpi=140)
+    for values, color in [(raw, "#1f77b4"), (blurred, "#d55e00")]:
+        weights = np.ones(values.shape, dtype=np.float64) / max(1, values.size)
+        ax.hist(
+            values,
+            bins=int(bins),
+            range=(0.0, upper),
+            weights=weights,
+            color=color,
+            edgecolor="#202020",
+            linewidth=0.6,
+            alpha=0.30,
+        )
+    ax.legend(
+        handles=[
+            Line2D([0], [0], color="#1f77b4", linewidth=2.0, label="Raw pixels"),
+            Line2D([0], [0], color="#d55e00", linewidth=2.0, label="Blurred pixels"),
+        ],
+        frameon=True,
+    )
+    ax.set_xlim(0.0, upper)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel("Slip Intensity (nm)", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Normalized Frequency", fontsize=12, fontweight="bold")
+    ax.set_title(
+        f"Event {event_detail['event_id']} pixel distribution "
+        f"({int(event_detail['event_pixel_count']):,} pixels)",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    return fig
+
+
+def plot_event_peak_magnitude_distribution(
+    peak_values: pd.DataFrame,
+    bins: int,
+    x_max: float | None,
+    x_label: str,
+    show_kde: bool,
+):
+    import matplotlib.pyplot as plt
+
+    value_col = "peak_slip_intensity_nm" if "peak_slip_intensity_nm" in peak_values.columns else "peak_bln_magnitude"
+    values = peak_values[value_col].to_numpy(dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        raise ValueError("No finite peak BLN magnitudes are available for plotting.")
+
+    upper = float(x_max) if x_max is not None and x_max > 0 else float(values.max())
+    upper = max(upper, float(values.max()), 1.0)
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=140)
+    weights = np.ones(values.shape, dtype=np.float64) / max(1, values.size)
+    counts, bin_edges, _ = ax.hist(
+        values,
+        bins=int(bins),
+        range=(0.0, upper),
+        weights=weights,
+        color="#b9d7e5",
+        edgecolor="#303030",
+        linewidth=0.8,
+        alpha=0.75,
+        label="Events",
+    )
+
+    if show_kde and values.size >= 3 and np.unique(values).size >= 2:
+        try:
+            from scipy.stats import gaussian_kde
+
+            xs = np.linspace(0.0, upper, 400)
+            kde = gaussian_kde(values)
+            bin_width = float(bin_edges[1] - bin_edges[0]) if len(bin_edges) > 1 else upper / max(1, int(bins))
+            ax.plot(xs, kde(xs) * bin_width, color="#1f77b4", linewidth=2.0, label="KDE")
+        except Exception:
+            pass
+
+    ax.set_xlim(0.0, upper)
+    ax.set_ylim(bottom=0.0)
+    ax.set_xlabel(x_label, fontsize=14, fontweight="bold")
+    ax.set_ylabel("Normalized Frequency", fontsize=14, fontweight="bold")
+    ax.legend(frameon=True)
+    ax.grid(False)
+    fig.tight_layout()
+    return fig
+
+
+def plot_multi_event_peak_magnitude_distribution(
+    series: list[dict],
+    bins: int,
+    x_max: float | None,
+    x_label: str,
+    show_kde: bool,
+    figure3_style: bool,
+    y_mode: str = "fraction",
+    auto_x_percentile: float = 100.0,
+    kde_bw_adjust: float = 1.0,
+    rt_style: bool = False,
+):
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    colors = ["#1f77b4", "#e69f00", "#009e73", "#cc79a7", "#56b4e9"]
+    value_sets: list[tuple[str, np.ndarray]] = []
+    for item in series:
+        frame = item["event_peak_values"]
+        value_col = "peak_slip_intensity_nm" if "peak_slip_intensity_nm" in frame.columns else "peak_bln_magnitude"
+        values = frame[value_col].to_numpy(dtype=np.float64)
+        values = values[np.isfinite(values)]
+        if values.size:
+            value_sets.append((str(item.get("label", f"Dataset {len(value_sets) + 1}")), values))
+    if not value_sets:
+        raise ValueError("No finite peak BLN magnitudes are available for plotting.")
+
+    all_values = np.concatenate([values for _, values in value_sets])
+    data_max = float(np.nanmax(all_values))
+    if x_max is not None and x_max > 0:
+        upper = float(x_max)
+    else:
+        percentile = min(100.0, max(0.0, float(auto_x_percentile)))
+        upper = float(np.nanpercentile(all_values, percentile))
+    upper = max(upper, 1.0)
+    if rt_style:
+        fig, ax = plt.subplots(figsize=(10.0, 5.42), dpi=140)
+    elif figure3_style:
+        fig, ax = plt.subplots(figsize=(5.0, 5.0), dpi=170)
+    else:
+        fig, ax = plt.subplots(figsize=(7.2, 5.0), dpi=140)
+
+    mode = str(y_mode).strip().lower()
+    if mode not in {"density", "fraction", "count"}:
+        mode = "fraction"
+    bin_edges = np.linspace(0.0, upper, int(bins) + 1)
+    bin_width = float(bin_edges[1] - bin_edges[0]) if len(bin_edges) > 1 else upper / max(1, int(bins))
+    legend_handles = []
+    for idx, (label, values) in enumerate(value_sets):
+        color = colors[idx % len(colors)]
+        weights = None
+        density = False
+        if mode == "fraction":
+            weights = np.ones(values.shape, dtype=np.float64) / max(1, values.size)
+        elif mode == "density":
+            density = True
+        _, bin_edges, _ = ax.hist(
+            values,
+            bins=bin_edges,
+            weights=weights,
+            density=density,
+            color=color,
+            edgecolor="#202020",
+            linewidth=0.8,
+            alpha=0.35 if rt_style else (0.22 if figure3_style else 0.35),
+        )
+        legend_handles.append(Line2D([0], [0], color=color, linewidth=2.0, label=label))
+        if show_kde and values.size >= 3 and np.unique(values).size >= 2:
+            try:
+                from scipy.stats import gaussian_kde
+
+                xs = np.linspace(0.0, upper, 500)
+                kde = gaussian_kde(values)
+                kde.set_bandwidth(kde.factor * float(kde_bw_adjust))
+                ys = kde(xs)
+                if mode == "fraction":
+                    ys = ys * bin_width
+                elif mode == "count":
+                    ys = ys * values.size * bin_width
+                ax.plot(xs, ys, color=color, linewidth=2.0)
+            except Exception:
+                pass
+
+    ax.set_xlim(0.0, upper)
+    ax.set_ylim(bottom=0.0)
+    xlabel_size = 16 if rt_style else (15 if figure3_style else 14)
+    ylabel_size = 16 if rt_style else (15 if figure3_style else 14)
+    ax.set_xlabel(x_label, fontsize=xlabel_size, fontweight="bold")
+    ylabel = {
+        "density": "Normalized frequency",
+        "fraction": "Normalized Frequency",
+        "count": "Counts",
+    }[mode]
+    ax.set_ylabel(ylabel, fontsize=ylabel_size, fontweight="bold")
+    ax.legend(handles=legend_handles, title="Strain" if rt_style else None, frameon=True, loc="upper right")
+    ax.grid(bool(rt_style))
+    if rt_style:
+        ax.tick_params(axis="both", labelsize=14)
+        for spine in ax.spines.values():
+            spine.set_linewidth(2.0)
+    elif figure3_style:
+        ax.tick_params(axis="both", labelsize=12)
+        for spine in ax.spines.values():
+            spine.set_linewidth(1.2)
+    fig.tight_layout()
+    return fig
+
+
+def read_slip_intensity_values_csv(csv_path: str, label: str) -> pd.DataFrame:
+    frame = pd.read_csv(csv_path)
+    if "peak_slip_intensity_nm" not in frame.columns:
+        if "peak_bln_magnitude" not in frame.columns:
+            raise ValueError(
+                f"{csv_path} must include peak_slip_intensity_nm, or peak_bln_magnitude for conversion."
+            )
+        frame["peak_slip_intensity_nm"] = pd.to_numeric(
+            frame["peak_bln_magnitude"], errors="coerce"
+        ).astype(float) * BLN_TO_NM_SCALE
+    frame["peak_slip_intensity_nm"] = pd.to_numeric(frame["peak_slip_intensity_nm"], errors="coerce")
+    frame = frame.dropna(subset=["peak_slip_intensity_nm"]).copy()
+    if frame.empty:
+        raise ValueError(f"{csv_path} has no finite slip-intensity values.")
+    if "series_label" not in frame.columns:
+        frame.insert(0, "series_label", label)
+    else:
+        frame["series_label"] = frame["series_label"].fillna(label).astype(str)
+    return frame.reset_index(drop=True)
+
+
+def slip_intensity_frame_stats(frame: pd.DataFrame) -> dict:
+    values = frame["peak_slip_intensity_nm"].to_numpy(dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        values = np.array([0.0], dtype=np.float64)
+    return {
+        "events_sampled": int(values.size),
+        "slip_intensity_nm_min": float(np.min(values)),
+        "slip_intensity_nm_median": float(np.median(values)),
+        "slip_intensity_nm_mean": float(np.mean(values)),
+        "slip_intensity_nm_max": float(np.max(values)),
+    }
+
+
+def save_slip_intensity_values(result: dict, prefix: str) -> Path:
+    safe_prefix = sanitize_file_prefix(prefix)
+    if not safe_prefix:
+        raise ValueError("Please provide a file prefix before saving.")
+    out_dir = ROOT / "tests" / "outputs" / "slip_intensity"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{safe_prefix}_event_peak_bln_values.csv"
+    if "series" in result:
+        combined = pd.concat([item["event_peak_values"] for item in result["series"]], ignore_index=True)
+        combined.to_csv(out_path, index=False)
+    else:
+        result["event_peak_values"].to_csv(out_path, index=False)
+    return out_path
 
 
 def count_events_with_ground_truth_overlap(frame: pd.DataFrame, ground_truth_points: set[tuple[int, int]]) -> int:
@@ -6295,6 +7766,285 @@ def run_pipeline(params: PipelineParams) -> dict:
     }
 
 
+def run_trial_band_mask_pipeline_with_progress(
+    params: PipelineParams,
+    band_percentile: float,
+    otsu_multiplier: float,
+    min_pixels: int,
+    closing_radius: int,
+) -> dict:
+    label = "Building mask events"
+    progress = st.progress(0.0, text=f"{label}: loading crop")
+    status = st.empty()
+
+    try:
+        status.caption("Loading selected crop/full image...")
+        region_stage = load_preprocessing_region(params)
+        progress.progress(0.15, text=f"{label}: applying CLAHE")
+        clahe_stage = run_clahe_stage(region_stage, params)
+
+        progress.progress(0.30, text=f"{label}: thresholding and labeling mask")
+        band = band_interior_seed_method(
+            clahe_stage["enhanced"],
+            percentile=float(band_percentile),
+            otsu_multiplier=float(otsu_multiplier),
+            min_pixels=int(min_pixels),
+            closing_radius=int(closing_radius),
+        )
+        mask_events = mask_components_to_event_result(band["labels"], band["components"])
+
+        progress.progress(1.0, text=f"{label}: complete")
+        return {
+            "params": params,
+            "crop": clahe_stage["crop"],
+            "region_gray": clahe_stage["gray"],
+            "enhanced": clahe_stage["enhanced"],
+            "band": band,
+            "mask_events": mask_events,
+        }
+    finally:
+        progress.empty()
+        status.empty()
+
+
+def run_trial_band_threshold_stage(
+    clahe_stage: dict,
+    percentile: float,
+    otsu_multiplier: float,
+) -> dict:
+    enhanced = clahe_stage["enhanced"]
+    enhanced = np.clip(enhanced.astype(np.float32, copy=False), 0.0, 1.0)
+    percentile_threshold = float(np.percentile(enhanced, percentile))
+    otsu_threshold = float(threshold_otsu(enhanced) * otsu_multiplier)
+    band_threshold = max(percentile_threshold, otsu_threshold)
+    candidate_mask = enhanced > band_threshold
+    return {
+        "params": clahe_stage["params"],
+        "crop": clahe_stage["crop"],
+        "gray": clahe_stage["gray"],
+        "enhanced": enhanced,
+        "candidate_mask": candidate_mask,
+        "percentile_threshold": percentile_threshold,
+        "otsu_threshold": otsu_threshold,
+        "band_threshold": band_threshold,
+    }
+
+
+def run_trial_band_clean_stage(
+    threshold_stage: dict,
+    min_pixels: int,
+    closing_radius: int,
+) -> dict:
+    clean_mask = remove_small_objects_by_label(threshold_stage["candidate_mask"], int(min_pixels))
+    if closing_radius > 0:
+        clean_mask = morphology.closing(clean_mask, morphology.disk(int(closing_radius)))
+        clean_mask = remove_small_objects_by_label(clean_mask, int(min_pixels))
+    return {
+        **threshold_stage,
+        "clean_mask": clean_mask,
+        "min_pixels": int(min_pixels),
+        "closing_radius": int(closing_radius),
+    }
+
+
+def components_from_clean_band_mask(
+    clean_mask: np.ndarray,
+    enhanced: np.ndarray,
+    min_pixels: int,
+    progress_callback=None,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    if progress_callback is not None:
+        progress_callback(0, 1, "labeling mask")
+    labels = measure.label(clean_mask)
+    props = measure.regionprops(labels, intensity_image=enhanced)
+    if progress_callback is not None:
+        progress_callback(1, 1, "labeling mask")
+    component_rows = []
+    total_props = max(1, len(props))
+    for index, prop in enumerate(props, start=1):
+        if prop.area < min_pixels:
+            if progress_callback is not None and (index == total_props or index % 25 == 0):
+                progress_callback(index, total_props, "measuring components")
+            continue
+        component_mask = labels[prop.slice] == prop.label
+        distance = ndi.distance_transform_edt(component_mask)
+        local_rows, local_cols = np.nonzero(component_mask)
+        if len(local_rows) == 0:
+            continue
+        local_distances = distance[local_rows, local_cols]
+        max_distance = float(local_distances.max())
+        best_distance_indices = np.flatnonzero(np.isclose(local_distances, max_distance))
+        if len(best_distance_indices) > 1:
+            local_intensities = enhanced[
+                prop.slice[0].start + local_rows[best_distance_indices],
+                prop.slice[1].start + local_cols[best_distance_indices],
+            ]
+            chosen = best_distance_indices[int(np.argmax(local_intensities))]
+        else:
+            chosen = int(best_distance_indices[0])
+        row = int(prop.slice[0].start + local_rows[chosen])
+        col = int(prop.slice[1].start + local_cols[chosen])
+        component_rows.append(
+            {
+                "label": int(prop.label),
+                "area": int(prop.area),
+                "seed_x": col,
+                "seed_y": row,
+                "max_distance_to_boundary": max_distance,
+                "seed_intensity": float(enhanced[row, col]),
+            }
+        )
+        if progress_callback is not None and (index == total_props or index % 25 == 0):
+            progress_callback(index, total_props, "measuring components")
+    return labels, pd.DataFrame(component_rows)
+
+
+def build_trial_mask_event_result(clean_stage: dict, params: PipelineParams, progress_callback=None) -> dict:
+    def component_progress(done: int, total: int, stage: str) -> None:
+        if progress_callback is None:
+            return
+        if stage == "labeling mask":
+            progress_callback(done, total, stage)
+            return
+        scaled_done = int(1 + 49 * (done / max(1, total)))
+        progress_callback(scaled_done, 100, stage)
+
+    labels, components = components_from_clean_band_mask(
+        clean_stage["clean_mask"],
+        clean_stage["enhanced"],
+        int(clean_stage["min_pixels"]),
+        progress_callback=component_progress,
+    )
+    band = {
+        "candidate_mask": clean_stage["candidate_mask"],
+        "clean_mask": clean_stage["clean_mask"],
+        "labels": labels,
+        "components": components,
+        "percentile_threshold": clean_stage["percentile_threshold"],
+        "otsu_threshold": clean_stage["otsu_threshold"],
+        "band_threshold": clean_stage["band_threshold"],
+        "min_pixels": clean_stage["min_pixels"],
+        "closing_radius": clean_stage["closing_radius"],
+    }
+
+    def event_progress(done: int, total: int, stage: str) -> None:
+        if progress_callback is None:
+            return
+        scaled_done = int(50 + 45 * (done / max(1, total)))
+        progress_callback(scaled_done, 100, stage)
+
+    mask_events = mask_components_to_event_result(labels, components, progress_callback=event_progress)
+    if progress_callback is not None:
+        progress_callback(100, 100, "finalizing")
+    return {
+        "signature": trial_mask_event_signature(clean_stage, params),
+        "params": params,
+        "crop": clean_stage["crop"],
+        "region_gray": clean_stage["gray"],
+        "enhanced": clean_stage["enhanced"],
+        "band": band,
+        "mask_events": mask_events,
+    }
+
+
+def trial_mask_event_signature(clean_stage: dict, params: PipelineParams) -> tuple:
+    return (
+        params.image_path,
+        params.display_min,
+        params.display_max,
+        params.display_brightness,
+        params.display_contrast,
+        params.use_full_image,
+        params.crop_x,
+        params.crop_y,
+        params.crop_width,
+        params.crop_height,
+        params.clahe_clip_limit,
+        float(clean_stage["percentile_threshold"]),
+        float(clean_stage["otsu_threshold"]),
+        float(clean_stage["band_threshold"]),
+        int(clean_stage["min_pixels"]),
+        int(clean_stage["closing_radius"]),
+    )
+
+
+def band_interior_seed_method(
+    enhanced: np.ndarray,
+    percentile: float,
+    otsu_multiplier: float,
+    min_pixels: int,
+    closing_radius: int,
+) -> dict:
+    threshold_stage = run_trial_band_threshold_stage(
+        {
+            "params": None,
+            "crop": None,
+            "gray": None,
+            "enhanced": enhanced,
+        },
+        percentile,
+        otsu_multiplier,
+    )
+    clean_stage = run_trial_band_clean_stage(threshold_stage, min_pixels, closing_radius)
+    labels, components = components_from_clean_band_mask(
+        clean_stage["clean_mask"],
+        clean_stage["enhanced"],
+        int(min_pixels),
+    )
+
+    return {
+        "candidate_mask": threshold_stage["candidate_mask"],
+        "clean_mask": clean_stage["clean_mask"],
+        "labels": labels,
+        "components": components,
+        "percentile_threshold": threshold_stage["percentile_threshold"],
+        "otsu_threshold": threshold_stage["otsu_threshold"],
+        "band_threshold": threshold_stage["band_threshold"],
+    }
+
+
+def mask_components_to_event_result(labels: np.ndarray, components: pd.DataFrame, progress_callback=None) -> dict:
+    accepted: list[DicLine] = []
+    if components.empty:
+        return {
+            "accepted": accepted,
+            "accepted_count": 0,
+            "rejected": 0,
+            "duplicates": 0,
+            "merged": 0,
+            "covered": 0,
+            "standalone_seeds": [],
+            "merged_seeds": [],
+            "merged_groups": [],
+        }
+
+    total_components = max(1, len(components))
+    for index, row in enumerate(components.itertuples(index=False), start=1):
+        label = int(row.label)
+        rr, cc = np.nonzero(labels == label)
+        points = {Point(x=int(col), y=int(r)) for r, col in zip(rr, cc)}
+        if not points:
+            if progress_callback is not None and (index == total_components or index % 10 == 0):
+                progress_callback(index, total_components, "building event pixels")
+            continue
+        seed = Point(x=int(row.seed_x), y=int(row.seed_y))
+        accepted.append(DicLine(points=points, seed_point=seed))
+        if progress_callback is not None and (index == total_components or index % 10 == 0):
+            progress_callback(index, total_components, "building event pixels")
+
+    return {
+        "accepted": accepted,
+        "accepted_count": len(accepted),
+        "rejected": 0,
+        "duplicates": 0,
+        "merged": 0,
+        "covered": 0,
+        "standalone_seeds": [line.seed_point for line in accepted if line.seed_point is not None],
+        "merged_seeds": [],
+        "merged_groups": [],
+    }
+
+
 def hough_seed_method(
     detection_mask: np.ndarray,
     enhanced: np.ndarray,
@@ -6957,6 +8707,95 @@ def show_hough_step2_result(result: dict) -> None:
     show_hough_event_save_controls(result)
 
 
+def show_trial_band_seed_result(result: dict) -> None:
+    display_rgb = result["crop"]["display_rgb"]
+    band = result["band"]
+    mask_events = result["mask_events"]
+    event_pixel_count = sum(line.size for line in mask_events["accepted"])
+
+    st.markdown("**Trial Mask Event Result**")
+    cols = st.columns(4)
+    cols[0].metric("Detected events", mask_events["accepted_count"])
+    cols[1].metric("Event pixels", f"{event_pixel_count:,}")
+    cols[2].metric("Band components", len(band["components"]))
+    cols[3].metric("Clean mask pixels", f"{int(np.asarray(band['clean_mask']).sum()):,}")
+
+    threshold_cols = st.columns(3)
+    threshold_cols[0].metric("Percentile threshold", f"{band['percentile_threshold']:.4f}")
+    threshold_cols[1].metric("Otsu x multiplier threshold", f"{band['otsu_threshold']:.4f}")
+    threshold_cols[2].metric("Final band threshold", f"{band['band_threshold']:.4f}")
+
+    st.caption(
+        "Event rule: each cleaned connected band-mask component is treated as one detected event. "
+        "The distance-transform interior point is kept only as a representative marker for the component."
+    )
+
+    seed_points = mask_events.get("standalone_seeds", [])
+    event_overlay = draw_mask_overlay(display_rgb, band["clean_mask"], (255, 0, 0)).astype(np.float32) / 255.0
+    event_overlay = draw_points(
+        event_overlay,
+        seed_points,
+        color=(1.0, 1.0, 0.0),
+        radius=4,
+        outline_color=(1.0, 1.0, 1.0),
+    )
+
+    st.markdown("**Mask Event Overlay**")
+    zoomable_image(event_overlay, "Trial mask components as detected events", key="trial_band_event_overlay")
+
+    with st.expander("Band component seed table", expanded=False):
+        st.dataframe(band["components"].head(500), width="stretch", hide_index=True)
+
+    show_trial_mask_event_save_controls(result)
+
+
+def show_trial_mask_event_save_controls(result: dict) -> None:
+    st.divider()
+    st.markdown("**Save Trial Mask Events**")
+
+    mask_events = result["mask_events"]["accepted"]
+    if not mask_events:
+        st.info("No trial mask events are available to save yet.")
+        return
+
+    default_prefix = default_trial_mask_event_prefix(result)
+    prefix = st.text_input(
+        "Output file prefix",
+        value=default_prefix,
+        key="trial_mask_event_save_prefix",
+        help=(
+            "Used to create <prefix>_events.csv and <prefix>_event_pixels.csv "
+            "under tests/outputs/mask_events."
+        ),
+    )
+    st.caption(
+        "The event pixel file stores global image coordinates, so these mask events can be "
+        "used by boundary cut, detection analysis, alignment scoring, and slip-intensity analysis."
+    )
+
+    if st.button("Save trial mask events", key="save_trial_mask_events"):
+        try:
+            save_result = save_trial_mask_events_csv(result, prefix)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        st.success(
+            f"Saved {save_result['event_count']} trial mask events and "
+            f"{save_result['pixel_count']} unique event pixels."
+        )
+        if save_result["duplicate_pixel_count"]:
+            st.caption(
+                f"Removed {save_result['duplicate_pixel_count']} duplicate pixel rows that were shared "
+                "by multiple events. The first saved event kept each shared pixel."
+            )
+        if save_result["skipped_event_count"]:
+            st.caption(
+                f"Skipped {save_result['skipped_event_count']} events because all of their pixels "
+                "were already assigned to earlier events."
+            )
+        st.code("\n".join(str(path) for path in save_result["paths"]), language="text")
+
+
 def show_regionprops_method_view(result: dict) -> None:
     display_rgb = result["crop"]["display_rgb"]
     show_method_counts(
@@ -7070,6 +8909,203 @@ def default_hough_event_prefix(result: dict) -> str:
     height, width = crop["display_rgb"].shape[:2]
     image_stem = Path(params.image_path).stem
     return f"{image_stem}_hough_x{origin_x}_y{origin_y}_w{width}_h{height}"
+
+
+def default_trial_mask_event_prefix(result: dict) -> str:
+    params = result["params"]
+    crop = result["crop"]
+    origin_x, origin_y = crop["origin"]
+    height, width = crop["display_rgb"].shape[:2]
+    image_stem = Path(params.image_path).stem
+    return f"{image_stem}_mask_events_x{origin_x}_y{origin_y}_w{width}_h{height}"
+
+
+def save_trial_mask_events_csv(result: dict, prefix: str) -> dict:
+    safe_prefix = sanitize_file_prefix(prefix)
+    if not safe_prefix:
+        raise ValueError("Please provide a file prefix before saving.")
+
+    out_dir = ROOT / "tests" / "outputs" / "mask_events"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    events_path = out_dir / f"{safe_prefix}_events.csv"
+    pixels_path = out_dir / f"{safe_prefix}_event_pixels.csv"
+    metadata_path = out_dir / f"{safe_prefix}_metadata.json"
+    crop = result["crop"]
+    params = result["params"]
+    crop_x, crop_y = crop["origin"]
+    created_at = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    event_rows = []
+    pixel_rows = []
+    assigned_pixels: set[tuple[int, int]] = set()
+    original_pixel_count = 0
+    duplicate_pixel_count = 0
+    skipped_event_count = 0
+    saved_event_index = 0
+
+    for line in result["mask_events"]["accepted"]:
+        points = sorted(line.points, key=lambda point: (point.y, point.x))
+        original_pixel_count += len(points)
+        unique_points = []
+        for point in points:
+            global_pixel = (crop_x + int(point.x), crop_y + int(point.y))
+            if global_pixel in assigned_pixels:
+                duplicate_pixel_count += 1
+                continue
+            assigned_pixels.add(global_pixel)
+            unique_points.append(global_pixel)
+
+        if not unique_points:
+            skipped_event_count += 1
+            continue
+
+        saved_event_index += 1
+        event_id = f"{safe_prefix}_{saved_event_index:04d}"
+        seed_x = crop_x + int(line.seed_point.x) if line.seed_point is not None else None
+        seed_y = crop_y + int(line.seed_point.y) if line.seed_point is not None else None
+        xs = [point[0] for point in unique_points]
+        ys = [point[1] for point in unique_points]
+        event_rows.append(
+            {
+                "event_id": event_id,
+                "method": "trial_mask",
+                "num_pixels": len(unique_points),
+                "seed_point_x": seed_x,
+                "seed_point_y": seed_y,
+                "bbox_min_x": int(min(xs)),
+                "bbox_max_x": int(max(xs)),
+                "bbox_min_y": int(min(ys)),
+                "bbox_max_y": int(max(ys)),
+                "crop_x": crop_x,
+                "crop_y": crop_y,
+                "image_path": params.image_path,
+                "created_at": created_at,
+            }
+        )
+        for pixel_x, pixel_y in unique_points:
+            pixel_rows.append(
+                {
+                    "event_id": event_id,
+                    "pixel_x": pixel_x,
+                    "pixel_y": pixel_y,
+                }
+            )
+
+    with events_path.open("w", newline="") as events_file:
+        writer = csv.DictWriter(
+            events_file,
+            fieldnames=[
+                "event_id",
+                "method",
+                "num_pixels",
+                "seed_point_x",
+                "seed_point_y",
+                "bbox_min_x",
+                "bbox_max_x",
+                "bbox_min_y",
+                "bbox_max_y",
+                "crop_x",
+                "crop_y",
+                "image_path",
+                "created_at",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(event_rows)
+
+    with pixels_path.open("w", newline="") as pixels_file:
+        writer = csv.DictWriter(
+            pixels_file,
+            fieldnames=["event_id", "pixel_x", "pixel_y"],
+        )
+        writer.writeheader()
+        writer.writerows(pixel_rows)
+
+    metadata = build_trial_mask_save_metadata(
+        result=result,
+        prefix=safe_prefix,
+        created_at=created_at,
+        events_path=events_path,
+        pixels_path=pixels_path,
+        metadata_path=metadata_path,
+        event_count=len(event_rows),
+        pixel_count=len(pixel_rows),
+        original_pixel_count=original_pixel_count,
+        duplicate_pixel_count=duplicate_pixel_count,
+        skipped_event_count=skipped_event_count,
+    )
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=json_safe_value), encoding="utf-8")
+
+    return {
+        "event_count": len(event_rows),
+        "pixel_count": len(pixel_rows),
+        "original_pixel_count": original_pixel_count,
+        "duplicate_pixel_count": duplicate_pixel_count,
+        "skipped_event_count": skipped_event_count,
+        "paths": [events_path, pixels_path, metadata_path],
+    }
+
+
+def build_trial_mask_save_metadata(
+    result: dict,
+    prefix: str,
+    created_at: str,
+    events_path: Path,
+    pixels_path: Path,
+    metadata_path: Path,
+    event_count: int,
+    pixel_count: int,
+    original_pixel_count: int,
+    duplicate_pixel_count: int,
+    skipped_event_count: int,
+) -> dict:
+    params = result["params"]
+    crop = result["crop"]
+    crop_height, crop_width = crop["display_rgb"].shape[:2]
+    band = result.get("band", {})
+    mask_events = result.get("mask_events", {})
+    return {
+        "created_at": created_at,
+        "method": "trial_mask_connected_components",
+        "prefix": prefix,
+        "outputs": {
+            "events_csv": str(events_path),
+            "event_pixels_csv": str(pixels_path),
+            "metadata_json": str(metadata_path),
+        },
+        "input_files": {
+            "bln_image": params.image_path,
+            "grx_image": params.grx_overlay_path,
+        },
+        "processing_region": {
+            "use_full_image": bool(params.use_full_image),
+            "crop_x": int(crop["origin"][0]),
+            "crop_y": int(crop["origin"][1]),
+            "crop_width": int(crop_width),
+            "crop_height": int(crop_height),
+            "source_note": crop.get("note", ""),
+        },
+        "parameters": asdict(params),
+        "trial_mask_metrics": {
+            "percentile_threshold": band.get("percentile_threshold"),
+            "otsu_threshold": band.get("otsu_threshold"),
+            "band_threshold": band.get("band_threshold"),
+            "min_pixels": band.get("min_pixels"),
+            "closing_radius": band.get("closing_radius"),
+            "band_components": len(band.get("components", [])),
+            "clean_mask_pixels": int(np.asarray(band.get("clean_mask", [])).sum()),
+            "accepted_events_before_save": mask_events.get("accepted_count"),
+            "standalone_seed_count": len(mask_events.get("standalone_seeds", [])),
+        },
+        "save_metrics": {
+            "saved_event_count": int(event_count),
+            "saved_unique_event_pixels": int(pixel_count),
+            "original_event_pixels_before_deduplication": int(original_pixel_count),
+            "duplicate_pixel_rows_removed": int(duplicate_pixel_count),
+            "skipped_events_after_deduplication": int(skipped_event_count),
+        },
+    }
 
 
 def save_hough_events_csv(result: dict, prefix: str) -> dict:
