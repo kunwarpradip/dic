@@ -48,14 +48,12 @@ class LineListPanel(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.seed_grow_checkbox = QCheckBox("Add Event From Seed")
-        self.seed_grow_checkbox.setChecked(True)
-        self.seed_grow_checkbox.setEnabled(False)
-        self.seed_grow_checkbox.setToolTip("When enabled, clicking a seed pixel grows a new event with the original Java-style algorithm.")
         self.edit_mode = QComboBox()
-        self.edit_mode.addItems(["Select events", "Add pixels", "Erase pixels"])
+        self.edit_mode.addItems(["Select events", "Add pixels", "Erase pixels", "Draw cut line", "Grow by seed"])
         self.edit_mode.setEnabled(False)
-        self.edit_mode.setToolTip("Choose how mouse clicks edit the selected visible event.")
+        self.edit_mode.setToolTip(
+            "Choose the active manual interaction: select events, add pixels, erase pixels, draw a cut line, or grow a new event from a seed click."
+        )
         self.brush_radius = QSpinBox()
         self.brush_radius.setRange(1, 25)
         self.brush_radius.setValue(2)
@@ -97,7 +95,6 @@ class LineListPanel(QWidget):
         buttons.addWidget(self.delete_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.seed_grow_checkbox)
         edit_row = QHBoxLayout()
         edit_row.addWidget(self.edit_mode, 1)
         edit_row.addWidget(QLabel("Brush"))
@@ -118,7 +115,6 @@ class LineListPanel(QWidget):
         self.select_all_button.clicked.connect(lambda: self.select_all_requested.emit())
         self.merge_button.clicked.connect(self._merge_clicked)
         self.delete_button.clicked.connect(self._delete_clicked)
-        self.seed_grow_checkbox.toggled.connect(self.seed_grow_mode_changed.emit)
         self.edit_mode.currentTextChanged.connect(self._edit_mode_changed)
         self.brush_radius.valueChanged.connect(self.brush_radius_changed.emit)
         self.boundary_overlay_checkbox.toggled.connect(self.boundary_overlay_changed.emit)
@@ -129,16 +125,22 @@ class LineListPanel(QWidget):
         self.select_all_button.setEnabled(enabled)
         self.merge_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
-        self.seed_grow_checkbox.setEnabled(enabled)
-        self.edit_mode.setEnabled(cut_enabled)
-        self.brush_radius.setEnabled(cut_enabled)
+        self.edit_mode.setEnabled(enabled)
+        self.brush_radius.setEnabled(enabled)
         self.boundary_overlay_checkbox.setEnabled(enabled)
         self.boundary_cut_button.setEnabled(enabled)
         self.split_disconnected_button.setEnabled(enabled)
-        if not cut_enabled:
-            self.edit_mode.setCurrentIndex(0)
         if not enabled:
+            self.edit_mode.setCurrentIndex(0)
             self.boundary_overlay_checkbox.setChecked(False)
+
+    def set_draw_cut_enabled(self, enabled: bool) -> None:
+        target = "Draw cut line" if enabled else "Select events"
+        index = self.edit_mode.findText(target)
+        if index >= 0:
+            self.edit_mode.setCurrentIndex(index)
+        else:
+            self.cut_mode_changed.emit(enabled)
 
     def set_lines(self, lines: list[DicLine], visible_ids: set[UUID]) -> None:
         valid_lines = [line for line in lines if isinstance(line, DicLine)]
@@ -235,6 +237,23 @@ class LineListPanel(QWidget):
                 item.setSelected(new_state == Qt.CheckState.Checked)
                 return
 
+    def select_line(self, line_id: UUID) -> bool:
+        found = False
+        for widget in self.list_widgets.values():
+            widget.blockSignals(True)
+            for i in range(widget.count()):
+                item = widget.item(i)
+                selected = item.data(Qt.ItemDataRole.UserRole) == line_id
+                item.setSelected(selected)
+                if selected:
+                    found = True
+                    self.list_tabs.setCurrentWidget(widget)
+                    widget.scrollToItem(item)
+            widget.blockSignals(False)
+        if found:
+            self.selection_changed_for_actions.emit()
+        return found
+
     def _toggle_all(self, checked: bool) -> None:
         widget = self.current_list_widget()
         if widget is None:
@@ -269,6 +288,8 @@ class LineListPanel(QWidget):
         self.split_disconnected_requested.emit(selected_ids)
 
     def _edit_mode_changed(self, text: str) -> None:
+        self.cut_mode_changed.emit(text.startswith("Draw"))
+        self.seed_grow_mode_changed.emit(text.startswith("Grow"))
         if text.startswith("Add"):
             self.edit_mode_changed.emit("add")
         elif text.startswith("Erase"):

@@ -195,25 +195,20 @@ def merge_lines(lines: list[DicLine], selected_ids: set) -> tuple[list[DicLine],
 
 
 def get_cut_line_points(start: Point, end: Point, cut_line_width: int) -> set[Point]:
-    slope = 0.0
-    has_slope = False
-    if abs(end.x - start.x) > 1e-8:
-        has_slope = True
-        slope = (end.y - start.y) / (end.x - start.x)
-
-    intercept = start.x
-    if has_slope:
-        intercept = start.y - slope * start.x
-
     points: set[Point] = set()
-    start_x = min(start.x, end.x)
-    end_x = max(start.x, end.x)
-    half = cut_line_width // 2
-    for x in range(start_x, end_x + 1):
-        y = int(slope * x + intercept)
-        for i in range(x - half, x + half + 1):
-            for j in range(y - half, y + half + 1):
-                points.add(Point(i, j))
+    dx = int(end.x - start.x)
+    dy = int(end.y - start.y)
+    steps = max(abs(dx), abs(dy), 1)
+    radius = max(1, int(cut_line_width) // 2)
+    radius_squared = radius * radius
+    for step in range(steps + 1):
+        t = step / steps
+        x = int(round(start.x + dx * t))
+        y = int(round(start.y + dy * t))
+        for yy in range(y - radius, y + radius + 1):
+            for xx in range(x - radius, x + radius + 1):
+                if (xx - x) * (xx - x) + (yy - y) * (yy - y) <= radius_squared:
+                    points.add(Point(xx, yy))
     return points
 
 
@@ -221,33 +216,34 @@ def cut_selected_lines(
     lines: list[DicLine], selected_ids: set, start: Point, end: Point, cut_line_width: int
 ) -> tuple[list[DicLine], list[DicLine]]:
     cut_points = get_cut_line_points(start, end, cut_line_width)
-    candidates = [line for line in lines if line.id in selected_ids]
-    line_to_cut = next((line for line in candidates if line.points & cut_points), None)
-    if line_to_cut is None:
-        return lines, []
-
-    exclusion_points = line_to_cut.points & cut_points
-    components = _connected_components(line_to_cut.points - exclusion_points)
-    new_lines = [line for line in lines if line.id != line_to_cut.id]
+    new_lines: list[DicLine] = []
     daughters: list[DicLine] = []
-    for component in components:
-        if len(component) <= 1:
+    for line in lines:
+        if line.id not in selected_ids:
+            new_lines.append(line)
             continue
-        daughter = DicLine(
-            id=uuid4(),
-            is_manual=True,
-            points=component,
-            seed_point=None,
-            intensity_difference_tolerance=line_to_cut.intensity_difference_tolerance,
-            bfl_tolerance=line_to_cut.bfl_tolerance,
-            min_intensity=line_to_cut.min_intensity,
-        )
-        daughters.append(daughter)
-        new_lines.append(daughter)
-
-    if daughters and exclusion_points:
-        smallest = min(daughters, key=lambda line: len(line.points))
-        smallest.points.update(exclusion_points)
+        exclusion_points = line.points & cut_points
+        if not exclusion_points:
+            new_lines.append(line)
+            continue
+        components = [component for component in _connected_components(line.points - exclusion_points) if len(component) > 1]
+        if len(components) <= 1:
+            new_lines.append(line)
+            continue
+        for component in components:
+            daughter = DicLine(
+                id=uuid4(),
+                is_manual=True,
+                points=component,
+                seed_point=None,
+                intensity_difference_tolerance=line.intensity_difference_tolerance,
+                bfl_tolerance=line.bfl_tolerance,
+                min_intensity=line.min_intensity,
+            )
+            daughter.event_type = getattr(line, "event_type", "manual" if line.is_manual else "reviewed")
+            daughter.source_event_id = getattr(line, "source_event_id", str(line.id))
+            daughters.append(daughter)
+            new_lines.append(daughter)
 
     return new_lines, daughters
 

@@ -417,14 +417,24 @@ def load_black_boundary_mask(boundary_path: str, black_threshold: float) -> np.n
 def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams, progress_callback=None) -> dict:
     accepted_entries: list[dict] = []
     rejected = 0
+    skipped_covered = 0
+    grow_rgb = preprocess["grow_rgb"]
+    h, w = grow_rgb.shape[:2]
+    accepted_pixel_mask = np.zeros((h, w), dtype=bool)
 
     seeds = hough["seeds"]
     total_seeds = len(seeds)
     for seed_index, seed in enumerate(seeds, start=1):
+        if 0 <= seed.y < h and 0 <= seed.x < w and accepted_pixel_mask[seed.y, seed.x]:
+            skipped_covered += 1
+            if progress_callback is not None:
+                progress_callback(seed_index, total_seeds)
+            continue
+
         result = detect_line_from_seed(
             seed.x,
             seed.y,
-            preprocess["grow_rgb"],
+            grow_rgb,
             intensity_difference_tolerance=params.intensity_difference_tolerance,
             bfl_tolerance=params.best_fit_line_tolerance,
             min_intensity=params.min_intensity,
@@ -432,6 +442,8 @@ def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams
         )
         if result.line is None:
             rejected += 1
+            if progress_callback is not None:
+                progress_callback(seed_index, total_seeds)
             continue
 
         merge_indices = [
@@ -451,8 +463,10 @@ def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams
                 )
                 merged_seeds.update(entry["seeds"])
             accepted_entries.append({"line": merged_line, "seeds": merged_seeds, "was_merged": True})
+            mark_line_pixels_visited(accepted_pixel_mask, merged_line)
         else:
             accepted_entries.append({"line": result.line, "seeds": {seed}, "was_merged": False})
+            mark_line_pixels_visited(accepted_pixel_mask, result.line)
         if progress_callback is not None:
             progress_callback(seed_index, total_seeds)
 
@@ -478,6 +492,7 @@ def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams
         "accepted": accepted,
         "accepted_count": int(len(accepted)),
         "rejected": int(rejected),
+        "skipped_covered": int(skipped_covered),
         "merged": int(len(merged_groups)),
         "standalone_seeds": standalone_seeds,
         "merged_seeds": merged_seeds,
@@ -490,6 +505,13 @@ def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams
             merged_groups,
         ),
     }
+
+
+def mark_line_pixels_visited(visited: np.ndarray, line: DicLine) -> None:
+    h, w = visited.shape[:2]
+    for point in line.points:
+        if 0 <= point.x < w and 0 <= point.y < h:
+            visited[point.y, point.x] = True
 
 
 def select_spaced_seeds(

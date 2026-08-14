@@ -17,3 +17,6 @@ check_traces.py
 .dic_qt_alignment_parameter_defaults.json
 /bcc
 *.pdf
+build
+dist
+DIC_Event_App.spec

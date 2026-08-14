@@ -1186,7 +1186,7 @@ class AutoDetectionPanel(QWidget):
 
         self.trace_stats = QLabel("No filled events yet.")
         self.trace_stats.setWordWrap(True)
-        self.trace_stats.setToolTip("After tracing, shows detected event count, rejected seeds, merged groups, and event pixel count.")
+        self.trace_stats.setToolTip("After tracing, shows detected event count, skipped covered seeds, rejected seeds, merged groups, and event pixel count.")
         fill_layout.addWidget(self.trace_stats)
 
         self.hough_controls_stack = QStackedWidget()
@@ -1445,12 +1445,7 @@ class AutoDetectionPanel(QWidget):
         display_min, display_max = default_display_range(self._summary)
         self._display_base_range = (display_min, display_max)
         self._range_controls_updating = True
-        self.display_brightness_slider.blockSignals(True)
-        self.display_contrast_slider.blockSignals(True)
-        self.display_brightness_slider.setValue(0)
-        self.display_contrast_slider.setValue(0)
-        self.display_brightness_slider.blockSignals(False)
-        self.display_contrast_slider.blockSignals(False)
+        self._apply_display_adjustment_defaults()
         self._range_controls_updating = False
         self._update_display_adjustment_labels()
         crop_size = min(500, width, height)
@@ -1766,6 +1761,7 @@ class AutoDetectionPanel(QWidget):
         total_pixels = sum(line.size for line in self._trace["accepted"])
         self.trace_stats.setText(
             f"Detected events: {self._trace['accepted_count']:,}\n"
+            f"Skipped covered seeds: {self._trace.get('skipped_covered', 0):,}\n"
             f"Rejected seeds: {self._trace['rejected']:,}\n"
             f"Merged groups: {self._trace['merged']:,}\n"
             f"Event pixels: {total_pixels:,}"
@@ -1790,15 +1786,29 @@ class AutoDetectionPanel(QWidget):
 
     def _reset_display_adjustments(self) -> None:
         self._range_controls_updating = True
-        self.display_brightness_slider.blockSignals(True)
-        self.display_contrast_slider.blockSignals(True)
-        self.display_brightness_slider.setValue(0)
-        self.display_contrast_slider.setValue(0)
-        self.display_brightness_slider.blockSignals(False)
-        self.display_contrast_slider.blockSignals(False)
+        self._apply_display_adjustment_defaults()
         self._range_controls_updating = False
         self._update_display_adjustment_labels()
         self._refresh_crop_display()
+
+    def _apply_display_adjustment_defaults(self) -> None:
+        brightness = 0
+        contrast = 0
+        if AUTO_PARAMETER_DEFAULTS_PATH.exists():
+            try:
+                with AUTO_PARAMETER_DEFAULTS_PATH.open("r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+                brightness = int(data.get("display_brightness", 0))
+                contrast = int(data.get("display_contrast", 0))
+            except Exception:
+                brightness = 0
+                contrast = 0
+        self.display_brightness_slider.blockSignals(True)
+        self.display_contrast_slider.blockSignals(True)
+        self.display_brightness_slider.setValue(max(self.display_brightness_slider.minimum(), min(self.display_brightness_slider.maximum(), brightness)))
+        self.display_contrast_slider.setValue(max(self.display_contrast_slider.minimum(), min(self.display_contrast_slider.maximum(), contrast)))
+        self.display_brightness_slider.blockSignals(False)
+        self.display_contrast_slider.blockSignals(False)
 
     def _display_adjustment_changed(self) -> None:
         if self._range_controls_updating:

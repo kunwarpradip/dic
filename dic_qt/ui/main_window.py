@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.algorithm import detect_line_from_seed, cut_selected_lines, merge_lines
+from ..core.algorithm import detect_line_from_seed, cut_selected_lines, is_point_in_line, merge_lines
 from ..core.image_io import load_image_data
 from ..core.models import DicLine, DicSession, Point
 from ..core.repository import DicLineRepository, db_path_for_image
@@ -143,17 +143,16 @@ class MainWindow(QMainWindow):
         self.canvas.seed_clicked.connect(self.create_event_from_seed)
         self.canvas.empty_clicked.connect(self.empty_image_clicked)
         self.canvas.image_mouse_moved.connect(self.update_preview)
-        self.canvas.line_toggled.connect(self.toggle_line_visibility)
+        self.canvas.line_toggled.connect(self.select_line_from_canvas)
         self.canvas.cut_completed.connect(self.cut_lines)
         self.canvas.pixel_edit_requested.connect(self.edit_selected_event_pixels)
         self.canvas.zoom_changed.connect(self.zoom_changed)
         self.line_list.visibility_changed.connect(self.set_line_visibility)
-        self.line_list.selection_changed_for_actions.connect(self.show_selected_events_only)
+        self.line_list.selection_changed_for_actions.connect(self.update_event_selection_status)
         self.line_list.select_all_requested.connect(self.select_all_events)
         self.line_list.merge_requested.connect(self.merge_selected_lines)
         self.line_list.delete_requested.connect(self.delete_selected_lines)
-        self.line_list.seed_grow_checkbox.setChecked(True)
-        self.canvas.set_create_mode(True)
+        self.canvas.set_create_mode(False)
 
     def choose_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -348,18 +347,15 @@ class MainWindow(QMainWindow):
 
     def empty_image_clicked(self, x: int, y: int) -> None:
         self.status_label.setText(
-            f"Create event from click is off; no event created at x={x}, y={y}"
+            f"Grow by seed is off; no event created at x={x}, y={y}"
         )
 
     def set_create_mode(self, enabled: bool) -> None:
-        self.line_list.seed_grow_checkbox.blockSignals(True)
-        self.line_list.seed_grow_checkbox.setChecked(enabled)
-        self.line_list.seed_grow_checkbox.blockSignals(False)
         self.canvas.set_create_mode(enabled)
         if enabled:
-            self.status_label.setText("Create event from click is on")
+            self.status_label.setText("Grow by seed is on")
         else:
-            self.status_label.setText("Create event from click is off")
+            self.status_label.setText("Grow by seed is off")
 
     def project_files_changed_for_manual_boundary(self, _paths: dict) -> None:
         self._manual_boundary_mask = None
@@ -376,6 +372,14 @@ class MainWindow(QMainWindow):
 
     def toggle_line_visibility(self, line_id: UUID) -> None:
         self.line_list.toggle_line(line_id)
+
+    def select_line_from_canvas(self, line_id: UUID) -> None:
+        if self.line_list.select_line(line_id):
+            self.status_label.setText(
+                "Selected event from image. Check boxes control which events appear in the overlay."
+            )
+        else:
+            self.status_label.setText("Clicked event is not currently listed in Manual Review.")
 
     def merge_selected_lines(self, selected_ids: set[UUID]) -> None:
         if not selected_ids:
@@ -415,15 +419,15 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText(f"Displaying all {count} events")
 
-    def show_selected_events_only(self) -> None:
+    def update_event_selection_status(self) -> None:
         if not self._image_is_loaded():
             return
         selected_ids = self.line_list.selected_line_ids()
         if not selected_ids:
             return
-        self.session.visible_line_ids = set(selected_ids)
-        self.canvas.set_lines(self.session.lines, self.session.visible_line_ids)
-        self.status_label.setText(f"Displaying {len(selected_ids)} selected event(s)")
+        self.status_label.setText(
+            f"Selected {len(selected_ids)} event(s). Check boxes control which events appear in the overlay."
+        )
 
     def delete_selected_events(self) -> None:
         if not self._image_is_loaded():
@@ -431,12 +435,15 @@ class MainWindow(QMainWindow):
         self.delete_selected_lines(self.line_list.checked_line_ids())
 
     def cut_lines(self, start: Point, end: Point) -> None:
-        if self.canvas.zoom_level <= 0:
+        if not self._image_is_loaded():
             return
         selected_ids = self.line_list.selected_line_ids()
         if not selected_ids:
             selected_ids = set(self.session.visible_line_ids)
-        cut_width = max(2, int(2 * (self.session.image_height / max(1, self.canvas.height())) / 7))
+        if not selected_ids:
+            self.status_label.setText("Select or show at least one event before drawing a cut line.")
+            return
+        cut_width = max(3, int(self.line_list.brush_radius.value() * 2 + 1))
         new_lines, daughters = cut_selected_lines(
             self.session.lines,
             selected_ids,
@@ -445,7 +452,10 @@ class MainWindow(QMainWindow):
             cut_width,
         )
         if not daughters:
-            self.status_label.setText("Cut did not intersect a selected visible line")
+            self.status_label.setText(
+                f"Cut did not split an event. Tried {len(selected_ids)} selected/visible event(s); "
+                f"brush cut width was {cut_width} px."
+            )
             return
         self._push_undo_state()
         self.session.set_lines(new_lines)
@@ -560,13 +570,9 @@ class MainWindow(QMainWindow):
         )
 
     def edit_selected_event_pixels(self, mode: str, center: Point, radius: int) -> None:
-        selected_ids = self.line_list.selected_line_ids() or self.line_list.checked_line_ids()
-        if len(selected_ids) != 1:
-            self.status_label.setText("Select exactly one event before adding or erasing pixels.")
-            return
-        line_id = next(iter(selected_ids))
-        line = self.session.line_by_id(line_id)
+        line = self._manual_edit_target_line(center, radius)
         if line is None:
+            self.status_label.setText("Select one event or place the brush over a visible event before editing pixels.")
             return
         radius = max(1, int(radius))
         brush_points = {
@@ -587,9 +593,31 @@ class MainWindow(QMainWindow):
                 return
             self._push_undo_state()
             line.points.difference_update(brush_points)
+            if not line.points:
+                self.session.delete_lines({line.id})
+                if self.repository is not None:
+                    self.repository.delete_lines({line.id})
+                self.refresh_lines()
+                self.status_label.setText("Erased the selected event completely.")
+                return
         if self.repository is not None:
             self.repository.save_new_lines([line])
         self.refresh_lines()
+        action = "Added" if mode == "add" else "Erased"
+        self.status_label.setText(f"{action} pixels for event {line.id}; event now has {line.size:,} pixels.")
+
+    def _manual_edit_target_line(self, center: Point, radius: int) -> DicLine | None:
+        selected_ids = self.line_list.selected_line_ids()
+        if len(selected_ids) == 1:
+            return self.session.line_by_id(next(iter(selected_ids)))
+        checked_ids = self.line_list.checked_line_ids()
+        if len(checked_ids) == 1:
+            return self.session.line_by_id(next(iter(checked_ids)))
+        search_ids = set(self.session.visible_line_ids) or checked_ids
+        for line in self.session.lines:
+            if line.id in search_ids and is_point_in_line(center, line, max(3.0, float(radius))):
+                return line
+        return None
 
     def update_preview(self, x: int, y: int) -> None:
         self.preview.update_preview(self.image_rgb, x, y)
@@ -625,6 +653,7 @@ class MainWindow(QMainWindow):
         invalid_count = self._discard_invalid_lines()
         self.line_list.set_lines(self.session.lines, self.session.visible_line_ids)
         self.canvas.set_lines(self.session.lines, self.session.visible_line_ids)
+        self._apply_manual_tool_mode()
         self._update_history_buttons()
         if invalid_count:
             self.status_label.setText(
@@ -690,6 +719,17 @@ class MainWindow(QMainWindow):
 
     def _image_is_loaded(self) -> bool:
         return self.image_rgb is not None
+
+    def _apply_manual_tool_mode(self) -> None:
+        text = self.line_list.edit_mode.currentText()
+        self.canvas.set_cut_mode(text.startswith("Draw"))
+        self.canvas.set_create_mode(text.startswith("Grow"))
+        if text.startswith("Add"):
+            self.canvas.set_edit_mode("add")
+        elif text.startswith("Erase"):
+            self.canvas.set_edit_mode("erase")
+        else:
+            self.canvas.set_edit_mode("select")
 
     def _load_manual_boundary_mask(self) -> np.ndarray | None:
         if self.session.image_width <= 0 or self.session.image_height <= 0:
