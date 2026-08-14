@@ -102,6 +102,15 @@ PROJECT_FILE_DEFAULTS = {
     "app_transform_json_path": "",
 }
 
+DEBUG_PROJECT_FILE_DEFAULTS = {
+    "app_bln_image_path": "/Users/pkunwar/Desktop/DIC_Local_App/z_share_ti_cryo_DIC_data_2026-08-04/Fused_BlN_step3.tif",
+    "app_grx_image_path": "",
+    "app_ang_path": "/Users/pkunwar/Desktop/DIC_Local_App/z_share_ti_cryo_DIC_data_2026-08-04/undistorted_dic_cleaned_approximatecrop_ang.ang",
+    "app_ebsd_image_path": "/Users/pkunwar/Desktop/DIC_Local_App/z_share_ti_cryo_DIC_data_2026-08-04/Aligned_EBSD.tif",
+    "app_ebsd_boundary_path": "/Users/pkunwar/Desktop/DIC_Local_App/z_share_ti_cryo_DIC_data_2026-08-04/Aligned_EBSD_Boundary.tif",
+    "app_transform_json_path": "/Users/pkunwar/Desktop/DIC_Local_App/z_share_ti_cryo_DIC_data_2026-08-04/alignment_transformation.json",
+}
+
 LEGACY_PROJECT_FILE_DEFAULTS = {
     "app_bln_image_path": str(DEFAULT_IMAGE),
     "app_grx_image_path": str(DEFAULT_GRX_IMAGE),
@@ -134,6 +143,11 @@ def initialize_project_file_state() -> None:
 def reset_project_file_state() -> None:
     for key in PROJECT_FILE_DEFAULTS:
         st.session_state[key] = ""
+
+
+def use_debug_project_file_defaults() -> None:
+    for key, path in DEBUG_PROJECT_FILE_DEFAULTS.items():
+        st.session_state[key] = path
 
 
 def project_file_path(key: str) -> str:
@@ -481,6 +495,23 @@ def project_files_sidebar_section() -> None:
     st.sidebar.caption(
         "Set the shared local file paths once here. The detection, boundary, alignment, and dashboard tabs reuse these paths."
     )
+    debug_col, reset_col = st.sidebar.columns(2)
+    with debug_col:
+        if st.button(
+            "Use Debug Defaults",
+            key="project_files_use_debug_defaults",
+            help="Temporary helper for local Ti Cryo debugging. Remove before final release.",
+        ):
+            use_debug_project_file_defaults()
+            st.rerun()
+    with reset_col:
+        if st.button(
+            "Clear Paths",
+            key="project_files_clear_paths",
+            help="Clear all shared project file paths.",
+        ):
+            reset_project_file_state()
+            st.rerun()
 
     for key, label in PROJECT_FILE_LABELS.items():
         st.sidebar.text_input(
@@ -1577,7 +1608,7 @@ def trial_band_seed_tab(params: PipelineParams) -> None:
             "Band intensity percentile",
             50.0,
             99.9,
-            90.0,
+            80.0,
             0.1,
             key="trial_band_percentile",
             help="Keeps CLAHE pixels above this percentile. Higher values keep only brighter band interiors.",
@@ -1618,7 +1649,7 @@ def trial_band_seed_tab(params: PipelineParams) -> None:
             "Min band object pixels",
             1,
             5000,
-            max(1, int(params.min_object_size)),
+            151,
             10,
             key="trial_band_min_pixels",
             help="Removes connected candidate-band regions smaller than this many pixels.",
@@ -1628,7 +1659,7 @@ def trial_band_seed_tab(params: PipelineParams) -> None:
             "Band closing radius",
             0,
             30,
-            max(0, int(params.closing_radius)),
+            1,
             1,
             key="trial_band_closing_radius",
             help="Bridges small gaps in the band mask. Larger values can connect nearby pieces into one event.",
@@ -2676,6 +2707,12 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
         result_cols[2].metric("Uncertain", f"{class_counts.get('uncertain', 0):,}")
         result_cols[3].metric("Noise events", f"{class_counts.get('likely_noise', 0):,}")
         result_cols[4].metric("Shape-excluded", f"{len(excluded_shape_ids):,}")
+        if "best_trace_kind" in score_result.columns:
+            matched_rows = score_result[score_result["classification"].astype(str) == "likely_real"]
+            matched_kind_counts = matched_rows["best_trace_kind"].astype(str).str.lower().value_counts().to_dict()
+            kind_cols = st.columns(2)
+            kind_cols[0].metric("Matched slip events", f"{matched_kind_counts.get('slip', 0):,}")
+            kind_cols[1].metric("Matched twin events", f"{matched_kind_counts.get('twin', 0):,}")
         diagnostics = st.session_state.get("alignment_event_score_diagnostics", {})
         if diagnostics:
             diag_cols = st.columns(6)
@@ -2946,7 +2983,7 @@ def alignment_tab(params: PipelineParams | None = None) -> None:
                     "Category CSV filename prefix",
                     f"{trace_summary_prefix}_categories",
                     key="alignment_score_category_prefix",
-                    help="Creates separate CSV files for matched, uncertain, noise, and blob-like events.",
+                    help="Creates separate CSV files for matched, matched slip, matched twin, uncertain, noise, and blob-like events.",
                 )
             with category_cols[1]:
                 if st.button("Save category CSVs", key="alignment_save_score_category_csvs"):
@@ -3730,7 +3767,7 @@ def manual_boundary_cut_tab() -> None:
             "Boundary dilation radius",
             0,
             8,
-            1,
+            0,
             1,
             key="boundary_cut_dilation_radius",
             help="Expands boundary pixels before cutting. Higher values cut more aggressively near boundaries.",
@@ -3905,7 +3942,7 @@ def auto_boundary_cut_tab() -> None:
             "Boundary dilation radius",
             0,
             8,
-            1,
+            0,
             1,
             key="auto_boundary_cut_dilation_radius",
             help="Expands boundary pixels before cutting. Higher values cut more aggressively near boundaries.",
@@ -9359,6 +9396,22 @@ def save_event_score_category_csvs(
                 category,
             )
         )
+
+    if "best_trace_kind" in score_result.columns:
+        matched = score_result[score_result["classification"].astype(str) == "likely_real"].copy()
+        for kind in ["slip", "twin"]:
+            kind_frame = matched[matched["best_trace_kind"].astype(str).str.lower() == kind]
+            kind_ids = set(kind_frame["event_id"].astype(str)) if "event_id" in kind_frame.columns else set()
+            saved_paths.extend(
+                save_event_category_source_files(
+                    events,
+                    event_pixels,
+                    kind_ids,
+                    out_dir,
+                    safe_prefix,
+                    f"matched_{kind}",
+                )
+            )
 
     if morphology_result is not None and "event_type" in morphology_result.columns:
         blob_frame = morphology_result[morphology_result["event_type"].astype(str) == "blob_like"].copy()

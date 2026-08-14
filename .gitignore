@@ -12,5 +12,8 @@ check_traces.py
 *.bmp
 .DS_Store
 .agents*
+.dic_qt_analysis_defaults.json
+.dic_qt_auto_parameter_defaults.json
+.dic_qt_alignment_parameter_defaults.json
 /bcc
 *.pdf

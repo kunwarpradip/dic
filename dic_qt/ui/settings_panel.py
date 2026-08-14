@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from PySide6.QtWidgets import (
-    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QPushButton,
@@ -24,8 +23,6 @@ class SettingsPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.choose_file_button = QPushButton("Choose File")
-        self.create_event_checkbox = QCheckBox("Create event from click")
-        self.create_event_checkbox.setChecked(True)
         self.reset_button = QPushButton("Reset settings")
 
         self.intensity_tolerance = QSpinBox()
@@ -49,7 +46,6 @@ class SettingsPanel(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.choose_file_button)
-        layout.addWidget(self.create_event_checkbox)
         layout.addLayout(form)
         layout.addWidget(self.reset_button)
         layout.addStretch(1)

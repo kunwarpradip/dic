@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import csv
-import re
+import json
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QObject, QThread, Qt, Slot
 from PySide6.QtCore import QPointF, QRectF, Signal
 from PySide6.QtGui import (
     QBrush,
@@ -25,14 +24,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -54,23 +53,27 @@ from dic_qt.core.auto_pipeline import (
     image_size,
     image_value_summary,
     load_region,
+    run_boundary_cut_events,
+    run_mask_event_detection,
     run_hough_seed_detection,
     run_preprocessing,
     trace_hough_events,
 )
+from dic_qt.ui.alignment_analysis_panel import AlignmentAnalysisPanel
 
 
 MAX_CROP_PREVIEW_DIM = 1800
 MAX_OVERLAY_PREVIEW_DIM = 2400
-DEFAULT_IMAGE = (
-    Path(__file__).resolve().parents[2]
-    / "z_share_DIC_data_for_hv_mvu_pk"
-    / "Ti_Cryo"
-    / "Fused_BlN_step3.tif"
-)
+DISPLAY_ADJUSTMENT_SCALE = 2.0
+AUTO_PARAMETER_DEFAULTS_PATH = Path(__file__).resolve().parents[2] / ".dic_qt_auto_parameter_defaults.json"
 
 
-def display_crop_rgb_fast(arr: np.ndarray, display_min: float, display_max: float) -> np.ndarray:
+def display_crop_rgb_fast(
+    arr: np.ndarray,
+    display_min: float,
+    display_max: float,
+    brightness_adjust: float = 0.0,
+) -> np.ndarray:
     values = np.nan_to_num(np.squeeze(arr).astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
     if values.ndim == 3 and values.shape[2] >= 3:
         rgb = values[..., :3]
@@ -85,13 +88,18 @@ def display_crop_rgb_fast(arr: np.ndarray, display_min: float, display_max: floa
         gray = np.zeros(values.shape, dtype=np.uint8)
     else:
         gray = (np.clip((values - display_min) / (display_max - display_min), 0.0, 1.0) * 255).astype(np.uint8)
+    if abs(float(brightness_adjust)) > 1e-9:
+        gray = np.clip(
+            gray.astype(np.float32, copy=False) + float(brightness_adjust) / 100.0 * 127.5,
+            0.0,
+            255.0,
+        ).astype(np.uint8)
     return np.repeat(gray[..., None], 3, axis=2)
 
 
-def load_downsampled_preview(
+@lru_cache(maxsize=4)
+def load_downsampled_preview_array(
     path: str,
-    display_min: float,
-    display_max: float,
     max_dim: int = MAX_CROP_PREVIEW_DIM,
 ) -> tuple[np.ndarray, float, float]:
     with Image.open(path) as img:
@@ -101,23 +109,82 @@ def load_downsampled_preview(
         preview_height = max(1, int(round(original_height * scale)))
         preview = img.resize((preview_width, preview_height), Image.Resampling.BILINEAR)
         arr = np.asarray(preview).copy()
-    rgb = display_crop_rgb_fast(arr, display_min, display_max)
     scale_x = original_width / preview_width
     scale_y = original_height / preview_height
+    return arr, scale_x, scale_y
+
+
+def load_downsampled_preview(
+    path: str,
+    display_min: float,
+    display_max: float,
+    brightness_adjust: float = 0.0,
+    max_dim: int = MAX_CROP_PREVIEW_DIM,
+) -> tuple[np.ndarray, float, float]:
+    arr, scale_x, scale_y = load_downsampled_preview_array(path, max_dim)
+    rgb = display_crop_rgb_fast(arr, display_min, display_max, brightness_adjust)
     return rgb, scale_x, scale_y
 
 
-def downsample_rgb_for_view(image: np.ndarray, max_dim: int = MAX_OVERLAY_PREVIEW_DIM) -> np.ndarray:
+def downsample_rgb_for_view(
+    image: np.ndarray,
+    max_dim: int = MAX_OVERLAY_PREVIEW_DIM,
+    resample: Image.Resampling = Image.Resampling.BILINEAR,
+) -> np.ndarray:
     if max(image.shape[:2]) <= max_dim:
         return image
     pil_image = Image.fromarray(display_image(image))
-    pil_image.thumbnail((max_dim, max_dim), Image.Resampling.BILINEAR)
+    pil_image.thumbnail((max_dim, max_dim), resample)
     return np.asarray(pil_image).copy()
 
 
-def sanitize_file_prefix(prefix: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix.strip())
-    return safe.strip("._-")
+def sanitize_display_range(value: tuple[float, float], raw_min: float, raw_max: float) -> tuple[float, float]:
+    display_min, display_max = value
+    display_min = max(raw_min, min(float(display_min), raw_max))
+    display_max = max(raw_min, min(float(display_max), raw_max))
+    if display_max <= display_min:
+        display_max = min(raw_max, display_min + max((raw_max - raw_min) / 2000.0, 0.0001))
+        if display_max <= display_min:
+            display_min = raw_min
+            display_max = raw_max
+    return display_min, display_max
+
+
+def display_range_from_adjustments(
+    base_range: tuple[float, float],
+    contrast: float,
+    raw_min: float,
+    raw_max: float,
+) -> tuple[float, float]:
+    raw_min = float(raw_min)
+    raw_max = float(raw_max)
+    span = raw_max - raw_min
+    if span <= 0:
+        return raw_min, raw_max
+
+    min_width = max(span / 2000.0, 0.0001)
+    base_min, base_max = sanitize_display_range(base_range, raw_min, raw_max)
+    base_center = (base_min + base_max) / 2.0
+    base_width = max(min_width, min(base_max - base_min, span))
+    contrast = float(np.clip(contrast, -100.0, 100.0))
+
+    center = base_center
+    if contrast >= 0:
+        width = base_width * (1.0 - 0.95 * (contrast / 100.0))
+    else:
+        width = base_width + (span - base_width) * (abs(contrast) / 100.0)
+
+    width = max(min_width, min(width, span))
+    center = max(raw_min, min(center, raw_max))
+    display_min = center - width / 2.0
+    display_max = center + width / 2.0
+    if display_min < raw_min:
+        display_max += raw_min - display_min
+        display_min = raw_min
+    if display_max > raw_max:
+        display_min -= display_max - raw_max
+        display_max = raw_max
+    return sanitize_display_range((display_min, display_max), raw_min, raw_max)
 
 
 def load_downsampled_processing_region(
@@ -140,7 +207,7 @@ def load_downsampled_processing_region(
         if scale < 1.0:
             crop = crop.resize((preview_width, preview_height), Image.Resampling.BILINEAR)
         arr = np.asarray(crop).copy()
-    display_rgb = display_crop_rgb_fast(arr, params.display_min, params.display_max)
+    display_rgb = display_crop_rgb_fast(arr, params.display_min, params.display_max, params.display_brightness)
     return {
         "display_rgb": display_rgb,
         "detection_rgb": display_rgb,
@@ -186,6 +253,7 @@ def run_preprocessing_preview(params: AutoPipelineParams) -> dict:
         "crop": crop,
         "enhanced": enhanced,
         "ridges": ridges,
+        "candidate_mask": candidate_mask,
         "candidate_clean": candidate_clean,
         "display_mask": display_mask,
     }
@@ -292,6 +360,16 @@ class CropCanvas(QGraphicsView):
             self._zoom_factor = zoom_factor
         else:
             self.fit_to_window()
+
+    def clear_image(self) -> None:
+        self.scene().clear()
+        self._pixmap_item = None
+        self._image_bytes = None
+        self._image_shape = None
+        self._crop_rect = None
+        self._select_start = None
+        self._select_current = None
+        self.resetTransform()
 
     def set_crop_rect(self, x: int, y: int, width: int, height: int) -> None:
         self._crop_rect = QRectF(
@@ -571,25 +649,70 @@ class ZoomImageView(QGraphicsView):
         self._zoom_factor *= factor
 
 
+class TraceEventsWorker(QObject):
+    progress = Signal(int, str)
+    finished = Signal(object, float)
+    failed = Signal(str)
+
+    def __init__(self, preprocess: dict, hough: dict, params: AutoPipelineParams) -> None:
+        super().__init__()
+        self._preprocess = preprocess
+        self._hough = hough
+        self._params = params
+
+    @Slot()
+    def run(self) -> None:
+        started = time.perf_counter()
+        try:
+            total_seeds = len(self._hough.get("seeds", []))
+            self.progress.emit(35, f"Seed events 0/{total_seeds}")
+
+            def report_seed_progress(done: int, total: int) -> None:
+                if total <= 0:
+                    self.progress.emit(85, "Seed events complete")
+                    return
+                percent = 35 + int(round(50.0 * done / total))
+                self.progress.emit(percent, f"Seed events {done}/{total}")
+
+            result = trace_hough_events(
+                self._preprocess,
+                self._hough,
+                self._params,
+                progress_callback=report_seed_progress,
+            )
+            self.progress.emit(90, "Rendering overlay...")
+            result = dict(result)
+            result["overlay"] = downsample_rgb_for_view(result["overlay"])
+        except Exception as exc:  # pragma: no cover - UI safety path
+            self.failed.emit(str(exc))
+            return
+        self.finished.emit(result, time.perf_counter() - started)
+
+
 class AutoDetectionPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self._image_path: str | None = str(DEFAULT_IMAGE) if DEFAULT_IMAGE.exists() else None
+        self._project_files: dict[str, str] = {}
+        self._image_path: str | None = None
         self._summary: dict[str, float] | None = None
         self._region: dict | None = None
         self._preprocess: dict | None = None
         self._preprocess_preview: dict | None = None
         self._hough: dict | None = None
+        self._mask: dict | None = None
         self._trace: dict | None = None
+        self._boundary_cut: dict | None = None
+        self._trace_thread: QThread | None = None
+        self._trace_worker: TraceEventsWorker | None = None
         self._range_controls_updating = False
+        self._display_base_range: tuple[float, float] = (0.0, 1.0)
+        self.alignment_analysis_panel = AlignmentAnalysisPanel()
 
         layout = QVBoxLayout(self)
-        header = QLabel("Auto event detection")
-        header.setStyleSheet("font-weight: 700; font-size: 16px;")
-        layout.addWidget(header)
 
-        self.status_label = QLabel("Load a BLN image in Crop, choose a region, then tune preprocessing.")
+        self.status_label = QLabel("Load a BLN image in Project Files, choose a region, then tune preprocessing.")
         self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #374151;")
         self.status_label.setToolTip("Shows the current auto-detection workflow status and any processing messages.")
         layout.addWidget(self.status_label)
 
@@ -599,25 +722,22 @@ class AutoDetectionPanel(QWidget):
         self._build_crop_tab()
         self._build_display_tab()
         self._build_hough_tab()
-        self._build_trace_tab()
+        self._build_boundary_cut_tab()
+        self.tabs.addTab(self.alignment_analysis_panel, "Alignment")
+        self._load_parameter_defaults()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
-
-        if self._image_path:
-            self._load_image_metadata(self._image_path)
-
     def _build_crop_tab(self) -> None:
         tab = QWidget()
         layout = QHBoxLayout(tab)
 
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setMaximumWidth(380)
         sidebar = QWidget()
-        sidebar.setMaximumWidth(340)
+        sidebar_scroll.setWidget(sidebar)
         side_layout = QVBoxLayout(sidebar)
-        load_button = QPushButton("Load Image")
-        load_button.setToolTip("Choose the BLN/DIC image used for crop selection, preprocessing, Hough seeds, and tracing.")
-        load_button.clicked.connect(self._choose_image)
-        side_layout.addWidget(load_button)
         self.dimension_label = QLabel("Image: not loaded")
         self.dimension_label.setWordWrap(True)
         self.dimension_label.setToolTip("Original full-resolution image dimensions in pixels.")
@@ -653,44 +773,18 @@ class AutoDetectionPanel(QWidget):
 
         side_layout.addWidget(crop_box)
 
-        display_box = QGroupBox("Display")
-        display_box.setToolTip("Controls only how the image is displayed. Values below the minimum are black; values above the maximum are white.")
-        display_layout = QVBoxLayout(display_box)
-        range_form = QFormLayout()
-        self.display_min = self._double_spin(-1_000_000.0, 1_000_000.0, 0.001, 0.0, decimals=6)
-        self.display_max = self._double_spin(-1_000_000.0, 1_000_000.0, 0.001, 1.0, decimals=6)
-        self.display_min.setToolTip("Lower display range. Raw values at or below this value display as black.")
-        self.display_max.setToolTip("Upper display range. Raw values at or above this value display as white.")
-        range_form.addRow("Range min", self.display_min)
-        range_form.addRow("Range max", self.display_max)
-        display_layout.addLayout(range_form)
-        self.display_min_slider = QSlider(Qt.Orientation.Horizontal)
-        self.display_max_slider = QSlider(Qt.Orientation.Horizontal)
-        for slider in (self.display_min_slider, self.display_max_slider):
-            slider.setRange(0, 1000)
-            slider.setSingleStep(1)
-            slider.setPageStep(25)
-        self.display_min_slider.setToolTip("Coarse lower display range. Drag to quickly darken or brighten the image.")
-        self.display_max_slider.setToolTip("Coarse upper display range. Drag to quickly change contrast.")
-        display_layout.addWidget(QLabel("Range min slider"))
-        display_layout.addWidget(self.display_min_slider)
-        display_layout.addWidget(QLabel("Range max slider"))
-        display_layout.addWidget(self.display_max_slider)
-
-        range_buttons = QHBoxLayout()
-        auto_range = QPushButton("Auto Range")
-        auto_range.setToolTip("Use the 0.5th and 99.5th percentile values.")
-        auto_range.clicked.connect(self._set_auto_range)
-        reset_range = QPushButton("Reset Range")
-        reset_range.setToolTip("Use the true raw minimum and maximum values.")
-        reset_range.clicked.connect(self._set_reset_range)
-        range_buttons.addWidget(auto_range)
-        range_buttons.addWidget(reset_range)
-        display_layout.addLayout(range_buttons)
-        side_layout.addWidget(display_box)
+        crop_preview_label = QLabel("Selected Crop Preview")
+        crop_preview_label.setToolTip("Downsampled preview of the selected crop using the current brightness/contrast settings.")
+        crop_preview_label.setStyleSheet("font-weight: 700;")
+        side_layout.addWidget(crop_preview_label)
+        self.crop_preview = ZoomImageView()
+        self.crop_preview.setMinimumSize(320, 260)
+        self.crop_preview.setToolTip("Preview of the selected crop. Use mouse wheel to zoom, 0 to fit, and space-drag to pan.")
+        side_layout.addWidget(self.crop_preview)
         side_layout.addStretch(1)
 
         self.crop_canvas = CropCanvas()
+        self.crop_canvas.setMinimumSize(620, 420)
         self.crop_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.crop_canvas.crop_changed.connect(self._set_crop_from_canvas)
         right_side = QWidget()
@@ -702,35 +796,106 @@ class AutoDetectionPanel(QWidget):
         right_layout.addWidget(original_label)
         right_layout.addWidget(self.crop_canvas, 1)
         self.crop_canvas.setToolTip("Drag to select a crop. Use =/+ and - to zoom, 0 to fit, mouse wheel to zoom, and space-drag to pan.")
-        layout.addWidget(sidebar)
+        layout.addWidget(sidebar_scroll)
         layout.addWidget(right_side, 1)
 
         for widget in (self.crop_x, self.crop_y, self.crop_width, self.crop_height):
             widget.valueChanged.connect(self._crop_spin_changed)
-        self.display_min.valueChanged.connect(self._display_spin_changed)
-        self.display_max.valueChanged.connect(self._display_spin_changed)
-        self.display_min_slider.valueChanged.connect(self._display_slider_changed)
-        self.display_max_slider.valueChanged.connect(self._display_slider_changed)
         self.tabs.addTab(tab, "Crop")
         self.tabs.setTabToolTip(
             self.tabs.indexOf(tab),
-            "Load the BLN image, adjust display range, and select the full image or a crop.",
+            "Select the full image or a crop. Display and preprocessing controls are in Common Steps.",
         )
+
+    def _build_display_controls(self) -> QGroupBox:
+        display_box = QGroupBox("Brightness / Contrast")
+        display_box.setToolTip("Controls how the BLN values are mapped into the 0-255 image used by later preprocessing steps.")
+        display_layout = QVBoxLayout(display_box)
+        self.display_stats_label = QLabel("Raw range: -")
+        self.display_stats_label.setWordWrap(True)
+        self.display_stats_label.setToolTip("Raw BLN value summary for the loaded image.")
+        display_layout.addWidget(self.display_stats_label)
+
+        self.display_brightness_label = QLabel("Brightness: +0")
+        self.display_brightness_label.setToolTip("Positive values brighten the mapped image; negative values darken it.")
+        self.display_brightness_slider = QSlider(Qt.Orientation.Horizontal)
+        self.display_brightness_slider.setRange(-200, 200)
+        self.display_brightness_slider.setValue(0)
+        self.display_brightness_slider.setSingleStep(1)
+        self.display_brightness_slider.setPageStep(20)
+        self.display_brightness_slider.setToolTip("Positive values brighten the mapped image; negative values darken it.")
+        display_layout.addWidget(self.display_brightness_label)
+        brightness_controls = QHBoxLayout()
+        brightness_down = QPushButton("-")
+        brightness_down.setToolTip("Decrease brightness by 0.5.")
+        brightness_down.setAutoRepeat(True)
+        brightness_down.setAutoRepeatInterval(60)
+        brightness_down.clicked.connect(lambda checked=False: self._nudge_display_adjustment(self.display_brightness_slider, -0.5))
+        brightness_up = QPushButton("+")
+        brightness_up.setToolTip("Increase brightness by 0.5.")
+        brightness_up.setAutoRepeat(True)
+        brightness_up.setAutoRepeatInterval(60)
+        brightness_up.clicked.connect(lambda checked=False: self._nudge_display_adjustment(self.display_brightness_slider, 0.5))
+        brightness_controls.addWidget(brightness_down)
+        brightness_controls.addWidget(self.display_brightness_slider, 1)
+        brightness_controls.addWidget(brightness_up)
+        display_layout.addLayout(brightness_controls)
+
+        self.display_contrast_label = QLabel("Contrast: +0")
+        self.display_contrast_label.setToolTip("Positive values increase contrast; negative values reduce contrast.")
+        self.display_contrast_slider = QSlider(Qt.Orientation.Horizontal)
+        self.display_contrast_slider.setRange(-200, 200)
+        self.display_contrast_slider.setValue(0)
+        self.display_contrast_slider.setSingleStep(1)
+        self.display_contrast_slider.setPageStep(20)
+        self.display_contrast_slider.setToolTip("Positive values increase contrast; negative values reduce contrast.")
+        display_layout.addWidget(self.display_contrast_label)
+        contrast_controls = QHBoxLayout()
+        contrast_down = QPushButton("-")
+        contrast_down.setToolTip("Decrease contrast by 0.5.")
+        contrast_down.setAutoRepeat(True)
+        contrast_down.setAutoRepeatInterval(60)
+        contrast_down.clicked.connect(lambda checked=False: self._nudge_display_adjustment(self.display_contrast_slider, -0.5))
+        contrast_up = QPushButton("+")
+        contrast_up.setToolTip("Increase contrast by 0.5.")
+        contrast_up.setAutoRepeat(True)
+        contrast_up.setAutoRepeatInterval(60)
+        contrast_up.clicked.connect(lambda checked=False: self._nudge_display_adjustment(self.display_contrast_slider, 0.5))
+        contrast_controls.addWidget(contrast_down)
+        contrast_controls.addWidget(self.display_contrast_slider, 1)
+        contrast_controls.addWidget(contrast_up)
+        display_layout.addLayout(contrast_controls)
+
+        self.display_range_label = QLabel("Display window: -")
+        self.display_range_label.setWordWrap(True)
+        self.display_range_label.setToolTip("Computed raw-value window. Values below this map to black; above this map to white.")
+        display_layout.addWidget(self.display_range_label)
+        default_button = QPushButton("Set As Default")
+        default_button.setToolTip("Save current brightness/contrast controls as the default for future app sessions.")
+        default_button.clicked.connect(self._save_parameter_defaults)
+        display_layout.addWidget(default_button)
+
+        self.display_brightness_slider.valueChanged.connect(self._display_adjustment_changed)
+        self.display_contrast_slider.valueChanged.connect(self._display_adjustment_changed)
+        return display_box
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if (
             event.type() == QEvent.Type.KeyPress
             and self.tabs.currentWidget() is not None
-            and self.tabs.tabText(self.tabs.currentIndex()) in {"Crop", "Preprocessing", "Hough Seeds", "Trace Events"}
+            and self.tabs.tabText(self.tabs.currentIndex()) in {"Crop", "Common Steps", "Detection", "Boundary Cuts"}
             and self.isVisible()
         ):
             active_tab = self.tabs.tabText(self.tabs.currentIndex())
             if active_tab == "Crop":
-                target = self.crop_canvas
-            elif active_tab == "Hough Seeds":
-                target = self.hough_preview
-            elif active_tab == "Trace Events":
-                target = self.trace_preview
+                target = self.crop_preview if self.crop_preview.hasFocus() else self.crop_canvas
+            elif active_tab == "Detection":
+                if hasattr(self, "detection_tabs") and self.detection_tabs.tabText(self.detection_tabs.currentIndex()).startswith("Hough"):
+                    target = self.trace_preview if self.hough_result_tabs.currentIndex() == 1 else self.hough_preview
+                else:
+                    target = self.mask_preview
+            elif active_tab == "Boundary Cuts":
+                target = self.boundary_cut_preview
             else:
                 target = self.display_preview
             text = event.text()
@@ -749,9 +914,9 @@ class AutoDetectionPanel(QWidget):
         tab = QWidget()
         layout = QHBoxLayout(tab)
 
-        controls = QGroupBox("Preprocessing")
+        controls = QGroupBox("Common Steps")
         controls.setMaximumWidth(340)
-        controls.setToolTip("Tune each preprocessing stage on a downsampled preview. Full-resolution processing is run later for Hough detection.")
+        controls.setToolTip("Shared preprocessing for Hough and Mask detection: brightness/contrast, CLAHE, threshold, and clean/close.")
         controls.setStyleSheet(
             """
             QGroupBox {
@@ -783,22 +948,19 @@ class AutoDetectionPanel(QWidget):
             """
         )
         control_layout = QVBoxLayout(controls)
-        self.display_original_button = QPushButton("Original")
+        self.display_original_button = QPushButton("Brightness / Contrast")
         self.display_clahe_button = QPushButton("CLAHE")
-        self.display_ridge_button = QPushButton("Ridge")
-        self.display_clean_button = QPushButton("Clean Mask")
-        self.display_seed_button = QPushButton("Seed Mask")
+        self.display_ridge_button = QPushButton("Threshold")
+        self.display_clean_button = QPushButton("Clean / Close")
         self.display_original_button.setToolTip("Shows the selected crop after display range mapping.")
         self.display_clahe_button.setToolTip("Applies CLAHE to the original selected crop.")
-        self.display_ridge_button.setToolTip("Applies the ridge filter to the CLAHE output.")
-        self.display_clean_button.setToolTip("Thresholds and cleans the ridge-filter output.")
-        self.display_seed_button.setToolTip("Creates the seed-detection mask from the cleaned mask.")
+        self.display_ridge_button.setToolTip("Enhances line-like features and thresholds the result into a candidate mask.")
+        self.display_clean_button.setToolTip("Removes small candidate objects and applies closing to bridge small gaps.")
         for button in (
             self.display_original_button,
             self.display_clahe_button,
             self.display_ridge_button,
             self.display_clean_button,
-            self.display_seed_button,
         ):
             button.setCheckable(True)
             button.setProperty("stageButton", True)
@@ -808,66 +970,72 @@ class AutoDetectionPanel(QWidget):
         self.display_clahe_button.clicked.connect(lambda: self._set_display_stage("clahe"))
         self.display_ridge_button.clicked.connect(lambda: self._set_display_stage("ridge"))
         self.display_clean_button.clicked.connect(lambda: self._set_display_stage("clean"))
-        self.display_seed_button.clicked.connect(lambda: self._set_display_stage("seed"))
         self._display_stage = "original"
         control_layout.addSpacing(14)
 
-        self.option_stack = QStackedWidget()
-        self.option_stack.setMinimumHeight(210)
-        self.option_stack.setToolTip("Options for the currently selected preprocessing stage.")
+        auto_process_button = QPushButton("Auto Process Common Steps")
+        auto_process_button.setToolTip(
+            "Run brightness/contrast, CLAHE, thresholding, and clean/close using the current/default parameters."
+        )
+        auto_process_button.clicked.connect(self._auto_process_common_steps)
+        control_layout.addWidget(auto_process_button)
 
-        self.original_options = QGroupBox("Original")
-        self.original_options.setToolTip("No parameters are applied. This shows the selected crop after display range mapping.")
-        original_layout = QVBoxLayout(self.original_options)
-        original_layout.addStretch(1)
-        self.option_stack.addWidget(self.original_options)
+        self.option_stack = QStackedWidget()
+        self.option_stack.setMinimumHeight(280)
+        self.option_stack.setToolTip("Parameters for the selected common processing step.")
+        self.brightness_options = self._build_display_controls()
+        self.option_stack.addWidget(self.brightness_options)
 
         self.clahe_options = QGroupBox("CLAHE Options")
         self.clahe_options.setToolTip("Contrast-limited adaptive histogram equalization. It improves local contrast before ridge detection.")
         form = QFormLayout(self.clahe_options)
-        self.clahe_clip = self._double_spin(0.001, 1.0, 0.001, 0.100, decimals=3)
+        self.clahe_clip = self._double_spin(0.001, 1.0, 0.001, 0.300, decimals=3)
         self.clahe_clip.setToolTip("Limits local contrast amplification in CLAHE.")
         self.clahe_clip_slider = QSlider(Qt.Orientation.Horizontal)
         self.clahe_clip_slider.setRange(1, 1000)
-        self.clahe_clip_slider.setValue(100)
+        self.clahe_clip_slider.setValue(300)
         self.clahe_clip_slider.setToolTip("Limits local contrast amplification in CLAHE.")
         form.addRow("Clip limit", self.clahe_clip)
         form.addRow("Clip slider", self.clahe_clip_slider)
+        clahe_default = QPushButton("Set As Default")
+        clahe_default.setToolTip("Save current CLAHE parameters as the default.")
+        clahe_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", clahe_default)
         self.option_stack.addWidget(self.clahe_options)
 
-        self.ridge_options = QGroupBox("Ridge Options")
-        self.ridge_options.setToolTip("Ridge filtering enhances line-like features after CLAHE.")
+        self.ridge_options = QGroupBox("Threshold Options")
+        self.ridge_options.setToolTip("Ridge filtering and thresholding create the candidate mask.")
         form = QFormLayout(self.ridge_options)
-        self.ridge_sigma_max = self._spin(1, 12, 1, 4)
+        self.ridge_sigma_max = self._spin(1, 12, 1, 3)
         self.ridge_sigma_max.setToolTip("Largest ridge-filter scale in pixels.")
-        form.addRow("Ridge sigma max", self.ridge_sigma_max)
-        self.option_stack.addWidget(self.ridge_options)
-
-        self.clean_options = QGroupBox("Clean Mask Options")
-        self.clean_options.setToolTip("Thresholds and cleans the ridge response to remove small noise and bridge small gaps.")
-        form = QFormLayout(self.clean_options)
-        self.ridge_percentile = self._double_spin(80.0, 99.9, 0.1, 88.0, decimals=1)
+        self.ridge_percentile = self._double_spin(80.0, 99.9, 0.1, 80.0, decimals=1)
         self.ridge_percentile.setToolTip("Percentile cutoff for the ridge response. Higher values keep fewer, stronger ridge pixels.")
-        self.threshold_multiplier = self._double_spin(0.1, 2.0, 0.05, 0.40, decimals=2)
+        self.threshold_multiplier = self._double_spin(0.1, 2.0, 0.05, 0.80, decimals=2)
         self.threshold_multiplier.setToolTip("Multiplier applied to the Otsu ridge threshold. Lower values include weaker ridges; higher values are stricter.")
-        self.min_object_size = self._spin(1, 5000, 5, 231)
-        self.min_object_size.setToolTip("Removes connected ridge-mask objects smaller than this many pixels.")
-        self.closing_radius = self._spin(0, 20, 1, 3)
-        self.closing_radius.setToolTip("Morphological closing radius. Higher values bridge small gaps but can merge nearby ridges.")
+        form.addRow("Ridge sigma max", self.ridge_sigma_max)
         form.addRow("Ridge percentile", self.ridge_percentile)
         form.addRow("Otsu multiplier", self.threshold_multiplier)
+        threshold_default = QPushButton("Set As Default")
+        threshold_default.setToolTip("Save current threshold parameters as the default.")
+        threshold_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", threshold_default)
+        self.option_stack.addWidget(self.ridge_options)
+
+        self.clean_options = QGroupBox("Clean / Close Options")
+        self.clean_options.setToolTip("Thresholds and cleans the ridge response to remove small noise and bridge small gaps.")
+        form = QFormLayout(self.clean_options)
+        self.min_object_size = self._spin(1, 5000, 5, 40)
+        self.min_object_size.setToolTip("Removes connected ridge-mask objects smaller than this many pixels.")
+        self.closing_radius = self._spin(0, 20, 1, 1)
+        self.closing_radius.setToolTip("Morphological closing radius. Higher values bridge small gaps but can merge nearby ridges.")
         form.addRow("Min object pixels", self.min_object_size)
         form.addRow("Closing radius", self.closing_radius)
+        clean_default = QPushButton("Set As Default")
+        clean_default.setToolTip("Save current clean/close parameters as the default.")
+        clean_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", clean_default)
         self.option_stack.addWidget(self.clean_options)
 
-        self.seed_options = QGroupBox("Seed Mask Options")
-        self.seed_options.setToolTip("Creates the final mask used by the Hough seed detector.")
-        form = QFormLayout(self.seed_options)
-        self.use_skeletonize = QCheckBox("Use skeletonized mask for seed detection")
-        self.use_skeletonize.setChecked(True)
-        self.use_skeletonize.setToolTip("Thin the cleaned ridge mask to centerlines before Hough detection.")
-        form.addRow("", self.use_skeletonize)
-        self.option_stack.addWidget(self.seed_options)
         control_layout.addWidget(self.option_stack)
 
         self.preprocess_stats = QLabel("No preprocessing result yet.")
@@ -893,36 +1061,29 @@ class AutoDetectionPanel(QWidget):
             self.closing_radius,
         ):
             widget.valueChanged.connect(self._refresh_display)
-        self.use_skeletonize.toggled.connect(self._refresh_display)
         self._update_stage_options()
-        self.tabs.addTab(tab, "Preprocessing")
+        self.tabs.addTab(tab, "Common Steps")
         self.tabs.setTabToolTip(
             self.tabs.indexOf(tab),
-            "Preview and tune preprocessing stages: Original, CLAHE, Ridge, Clean Mask, and Seed Mask.",
+            "Shared preprocessing stages used by Hough and Mask detection.",
         )
 
     def _build_hough_tab(self) -> None:
         tab = QWidget()
-        layout = QHBoxLayout(tab)
+        layout = QVBoxLayout(tab)
+        self.detection_tabs = QTabWidget()
+        layout.addWidget(self.detection_tabs, 1)
 
-        controls = QGroupBox("Hough Seeds")
-        controls.setMaximumWidth(340)
-        controls.setToolTip("Detect line segments from the seed mask and choose seed pixels for event tracing.")
-        controls.setStyleSheet(
-            """
-            QGroupBox {
-                font-weight: 700;
-            }
-            QGroupBox::title {
-                font-size: 15px;
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }
-            """
-        )
-        control_layout = QVBoxLayout(controls)
-        params_box = QGroupBox("Parameters")
+        hough_tab = QWidget()
+        hough_layout = QHBoxLayout(hough_tab)
+        hough_controls = QWidget()
+        hough_controls.setMaximumWidth(380)
+        hough_controls_layout = QVBoxLayout(hough_controls)
+        hough_controls_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.hough_detection_group = QGroupBox("Step 1: Seed Detection")
+        seed_layout = QVBoxLayout(self.hough_detection_group)
+        params_box = QGroupBox("Hough Parameters")
         params_box.setToolTip("Parameters for probabilistic Hough line detection and Hough-based seed selection.")
         form = QFormLayout(params_box)
         self.hough_threshold = self._spin(1, 200, 1, 20)
@@ -945,69 +1106,40 @@ class AutoDetectionPanel(QWidget):
         form.addRow("Seed spacing", self.hough_seed_spacing)
         form.addRow("", self.hough_use_all_seeds)
         form.addRow("Max seeds", self.hough_max_seeds)
-        control_layout.addWidget(params_box)
+        hough_default = QPushButton("Set As Default")
+        hough_default.setToolTip("Save current Hough seed parameters as the default.")
+        hough_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", hough_default)
+        seed_layout.addWidget(params_box)
 
         run_button = QPushButton("Detect Hough Lines And Seeds")
         run_button.setToolTip("Runs full-resolution preprocessing, detects Hough line segments, then selects seed points from the strongest pixel on each line.")
         run_button.clicked.connect(self._run_hough)
-        control_layout.addWidget(run_button)
+        seed_layout.addWidget(run_button)
 
         self.hough_progress = QLabel("Ready.")
         self.hough_progress.setWordWrap(True)
         self.hough_progress.setToolTip("Shows whether Hough seed detection is idle, running, failed, or completed with elapsed time.")
-        control_layout.addWidget(self.hough_progress)
+        seed_layout.addWidget(self.hough_progress)
+        self.hough_progress_bar = QProgressBar()
+        self.hough_progress_bar.setRange(0, 1)
+        self.hough_progress_bar.setValue(0)
+        self.hough_progress_bar.setTextVisible(True)
+        self.hough_progress_bar.setFormat("Ready")
+        self.hough_progress_bar.setToolTip("Shows progress for Hough seed detection. An animated bar means processing is active.")
+        seed_layout.addWidget(self.hough_progress_bar)
 
         self.hough_stats = QLabel("No Hough result yet.")
         self.hough_stats.setWordWrap(True)
         self.hough_stats.setToolTip("After processing, shows detected Hough line count, seed candidate count, and selected seed count.")
-        control_layout.addWidget(self.hough_stats)
-        control_layout.addStretch(1)
+        seed_layout.addWidget(self.hough_stats)
 
-        image_panel = QWidget()
-        image_layout = QVBoxLayout(image_panel)
-        image_layout.setContentsMargins(0, 0, 0, 0)
-        image_label = QLabel("Hough Lines And Selected Seeds")
-        image_label.setToolTip("Overlay image: Hough lines are red and selected seeds are yellow.")
-        image_label.setStyleSheet("font-weight: 700;")
-        image_layout.addWidget(image_label)
-        self.hough_preview = ZoomImageView()
-        self.hough_preview.setMinimumSize(520, 420)
-        self.hough_preview.setToolTip("Red pixels show detected Hough lines. Yellow points show selected seeds. Use =/+ and - to zoom, 0 to fit, or mouse wheel to zoom.")
-        image_layout.addWidget(self.hough_preview, 1)
-
-        layout.addWidget(controls)
-        layout.addWidget(image_panel, 1)
-        self.tabs.addTab(tab, "Hough Seeds")
-        self.tabs.setTabToolTip(
-            self.tabs.indexOf(tab),
-            "Run Hough line detection and select seed points for event tracing.",
-        )
-        self._sync_max_seed_enabled()
-
-    def _build_trace_tab(self) -> None:
-        tab = QWidget()
-        layout = QHBoxLayout(tab)
-
-        controls = QGroupBox("Trace Events")
-        controls.setMaximumWidth(340)
-        controls.setToolTip("Grow DIC events from Hough seeds and optionally merge compatible event fragments.")
-        controls.setStyleSheet(
-            """
-            QGroupBox {
-                font-weight: 700;
-            }
-            QGroupBox::title {
-                font-size: 15px;
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-            }
-            """
-        )
-        control_layout = QVBoxLayout(controls)
-        params_box = QGroupBox("Parameters")
-        params_box.setToolTip("Parameters for Java-style event growing and event merging.")
-        form = QFormLayout(params_box)
+        self.hough_fill_group = QGroupBox("Step 2: Fill Algorithm")
+        self.hough_fill_group.setToolTip("Grow DIC events from Hough seeds and optionally merge compatible event fragments.")
+        fill_layout = QVBoxLayout(self.hough_fill_group)
+        fill_params_box = QGroupBox("Fill Parameters")
+        fill_params_box.setToolTip("Parameters for Java-style event growing and event merging.")
+        form = QFormLayout(fill_params_box)
         self.intensity_tolerance = self._spin(0, 255, 1, 75)
         self.intensity_tolerance.setToolTip("Allowed blue-channel intensity drop while growing from each seed. Larger values let events grow through weaker pixels.")
         self.bfl_tolerance = self._double_spin(0.1, 100.0, 0.1, 7.0, decimals=1)
@@ -1022,9 +1154,6 @@ class AutoDetectionPanel(QWidget):
         self.merge_distance.setToolTip("Merge nearby same-angle events when their closest pixels are within this distance.")
         self.merge_angle = self._double_spin(0.0, 90.0, 0.5, 12.0, decimals=1)
         self.merge_angle.setToolTip("Maximum PCA/SVD angle difference, in degrees, for distance-based merging.")
-        self.connect_gaps = QCheckBox("Connect merged event gaps")
-        self.connect_gaps.setChecked(True)
-        self.connect_gaps.setToolTip("Add thin bridge pixels between disconnected merged components.")
         form.addRow("Intensity difference tolerance", self.intensity_tolerance)
         form.addRow("Best fit line tolerance", self.bfl_tolerance)
         form.addRow("Minimum intensity", self.min_intensity)
@@ -1032,60 +1161,216 @@ class AutoDetectionPanel(QWidget):
         form.addRow("Duplicate overlap", self.duplicate_overlap)
         form.addRow("Merge distance", self.merge_distance)
         form.addRow("Merge angle", self.merge_angle)
-        form.addRow("", self.connect_gaps)
-        control_layout.addWidget(params_box)
+        fill_default = QPushButton("Set As Default")
+        fill_default.setToolTip("Save current Hough fill parameters as the default.")
+        fill_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", fill_default)
+        fill_layout.addWidget(fill_params_box)
 
-        run_button = QPushButton("Trace Events From Hough Seeds")
-        run_button.setToolTip("Grows events from the selected Hough seeds using the Java-style algorithm, then merges duplicate or nearby compatible events.")
-        run_button.clicked.connect(self._run_trace)
-        control_layout.addWidget(run_button)
+        self.trace_button = QPushButton("Fill Events From Hough Seeds")
+        self.trace_button.setToolTip("Grows events from the selected Hough seeds using the Java-style algorithm, then merges duplicate or nearby compatible events.")
+        self.trace_button.clicked.connect(self._run_trace)
+        fill_layout.addWidget(self.trace_button)
 
         self.trace_progress = QLabel("Ready.")
         self.trace_progress.setWordWrap(True)
         self.trace_progress.setToolTip("Shows whether event tracing is idle, running, failed, or completed with elapsed time.")
-        control_layout.addWidget(self.trace_progress)
+        fill_layout.addWidget(self.trace_progress)
+        self.trace_progress_bar = QProgressBar()
+        self.trace_progress_bar.setRange(0, 1)
+        self.trace_progress_bar.setValue(0)
+        self.trace_progress_bar.setTextVisible(True)
+        self.trace_progress_bar.setFormat("Ready")
+        self.trace_progress_bar.setToolTip("Shows progress for the Hough fill algorithm. An animated bar means processing is active.")
+        fill_layout.addWidget(self.trace_progress_bar)
 
-        self.trace_stats = QLabel("No traced events yet.")
+        self.trace_stats = QLabel("No filled events yet.")
         self.trace_stats.setWordWrap(True)
         self.trace_stats.setToolTip("After tracing, shows detected event count, rejected seeds, merged groups, and event pixel count.")
-        control_layout.addWidget(self.trace_stats)
+        fill_layout.addWidget(self.trace_stats)
 
-        save_box = QGroupBox("Save")
-        save_box.setToolTip("Save traced Hough events as CSV files using global image coordinates.")
-        save_layout = QVBoxLayout(save_box)
-        self.trace_save_prefix = QLineEdit()
-        self.trace_save_prefix.setPlaceholderText("event_file_prefix")
-        self.trace_save_prefix.setToolTip("File prefix used for <prefix>_events.csv and <prefix>_event_pixels.csv.")
-        save_layout.addWidget(self.trace_save_prefix)
-        save_button = QPushButton("Save Detected Events")
-        save_button.setToolTip("Save detected events and their pixel coordinates to CSV files.")
-        save_button.clicked.connect(self._save_trace_events)
-        save_layout.addWidget(save_button)
-        self.trace_save_status = QLabel("")
-        self.trace_save_status.setWordWrap(True)
-        self.trace_save_status.setToolTip("Shows the saved CSV file locations after saving.")
-        save_layout.addWidget(self.trace_save_status)
-        control_layout.addWidget(save_box)
+        self.hough_controls_stack = QStackedWidget()
+        self.hough_controls_stack.addWidget(self.hough_detection_group)
+        self.hough_controls_stack.addWidget(self.hough_fill_group)
+        hough_controls_layout.addWidget(self.hough_controls_stack)
+        hough_controls_layout.addStretch(1)
+
+        hough_image_panel = QWidget()
+        hough_image_layout = QVBoxLayout(hough_image_panel)
+        hough_image_layout.setContentsMargins(0, 0, 0, 0)
+        hough_image_label = QLabel("Hough Detection Results")
+        hough_image_label.setToolTip("Switch between Hough seed detection and filled event overlays.")
+        hough_image_label.setStyleSheet("font-weight: 700;")
+        hough_image_layout.addWidget(hough_image_label)
+        self.hough_result_tabs = QTabWidget()
+        self.hough_preview = ZoomImageView()
+        self.hough_preview.setMinimumSize(520, 420)
+        self.hough_preview.setToolTip("Red pixels show detected Hough lines. Yellow points show selected seeds. Use =/+ and - to zoom, 0 to fit, or mouse wheel to zoom.")
+
+        self.trace_preview = ZoomImageView()
+        self.trace_preview.setMinimumSize(520, 420)
+        self.trace_preview.setToolTip("Detected filled event pixels are shown as an overlay. Use =/+ and - to zoom, 0 to fit, or mouse wheel to zoom.")
+
+        self.hough_result_tabs.addTab(self.hough_preview, "Step 1 Seeds")
+        self.hough_result_tabs.addTab(self.trace_preview, "Step 2 Filled Events")
+        self.hough_result_tabs.currentChanged.connect(self._sync_hough_step_controls)
+        hough_image_layout.addWidget(self.hough_result_tabs, 1)
+
+        hough_layout.addWidget(hough_controls)
+        hough_layout.addWidget(hough_image_panel, 1)
+
+        mask_tab = QWidget()
+        mask_layout_outer = QHBoxLayout(mask_tab)
+        mask_controls = QGroupBox("Mask Detection")
+        mask_controls.setMaximumWidth(360)
+        mask_controls.setToolTip("Uses Common Steps output directly. Connected mask components become finite-width events.")
+        mask_layout = QVBoxLayout(mask_controls)
+        description = QLabel(
+            "Uses Common Steps output directly: thresholded, cleaned, and closed mask components become events."
+        )
+        description.setWordWrap(True)
+        description.setToolTip("This branch does not use Hough seeds or seed growing. It keeps finite-width mask bands as event pixels.")
+        mask_layout.addWidget(description)
+
+        mask_run_button = QPushButton("Detect Mask Events")
+        mask_run_button.setToolTip("Runs full-resolution Common Steps and labels connected mask components as events.")
+        mask_run_button.clicked.connect(self._run_mask_events)
+        mask_layout.addWidget(mask_run_button)
+
+        self.mask_progress = QLabel("Ready.")
+        self.mask_progress.setWordWrap(True)
+        self.mask_progress.setToolTip("Shows whether mask-event detection is idle, running, failed, or completed with elapsed time.")
+        mask_layout.addWidget(self.mask_progress)
+        self.mask_progress_bar = QProgressBar()
+        self.mask_progress_bar.setRange(0, 1)
+        self.mask_progress_bar.setValue(0)
+        self.mask_progress_bar.setTextVisible(True)
+        self.mask_progress_bar.setFormat("Ready")
+        self.mask_progress_bar.setToolTip("Shows progress for mask event detection. An animated bar means processing is active.")
+        mask_layout.addWidget(self.mask_progress_bar)
+
+        self.mask_stats = QLabel("No mask-event result yet.")
+        self.mask_stats.setWordWrap(True)
+        self.mask_stats.setToolTip("After processing, shows connected component count, accepted event count, and event pixels.")
+        mask_layout.addWidget(self.mask_stats)
+        mask_layout.addStretch(1)
+        mask_image_panel = QWidget()
+        image_layout = QVBoxLayout(mask_image_panel)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        mask_image_label = QLabel("Mask Events")
+        mask_image_label.setToolTip("Overlay image for mask connected component detection.")
+        mask_image_label.setStyleSheet("font-weight: 700;")
+        image_layout.addWidget(mask_image_label)
+        self.mask_preview = ZoomImageView()
+        self.mask_preview.setMinimumSize(520, 420)
+        self.mask_preview.setToolTip("Red pixels show connected mask events. Use =/+ and - to zoom, 0 to fit, or mouse wheel to zoom.")
+        image_layout.addWidget(self.mask_preview, 1)
+
+        mask_layout_outer.addWidget(mask_controls)
+        mask_layout_outer.addWidget(mask_image_panel, 1)
+
+        self.detection_tabs.addTab(mask_tab, "Mask Detection")
+        self.detection_tabs.addTab(hough_tab, "Hough Detection")
+        self.detection_tabs.setTabToolTip(
+            self.detection_tabs.indexOf(hough_tab),
+            "Step 1 detects Hough seeds; Step 2 fills/grows events from those seeds.",
+        )
+        self.detection_tabs.setTabToolTip(
+            self.detection_tabs.indexOf(mask_tab),
+            "Treat cleaned mask components as detected events directly.",
+        )
+        self.tabs.addTab(tab, "Detection")
+        self.tabs.setTabToolTip(
+            self.tabs.indexOf(tab),
+            "Run either Hough-based detection or direct mask-component detection.",
+        )
+        self._sync_max_seed_enabled()
+
+    def _build_boundary_cut_tab(self) -> None:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+
+        controls = QGroupBox("Boundary Cut Events")
+        controls.setMaximumWidth(380)
+        controls.setToolTip("Cut detected events wherever they cross dark EBSD grain-boundary pixels.")
+        control_layout = QVBoxLayout(controls)
+
+        self.boundary_path_label = QLabel("Boundary image: not loaded")
+        self.boundary_path_label.setWordWrap(True)
+        self.boundary_path_label.setToolTip("EBSD boundary image path comes from the Project Files tab.")
+        control_layout.addWidget(self.boundary_path_label)
+
+        form = QFormLayout()
+        self.boundary_event_source = QComboBox()
+        self.boundary_event_source.addItems(["Mask events", "Hough filled events"])
+        self.boundary_event_source.setToolTip("Choose which current detected event set should be cut by the EBSD boundary image.")
+        self.boundary_black_threshold = self._double_spin(0.0, 1.0, 0.01, 0.60, decimals=2)
+        self.boundary_black_threshold.setToolTip("Boundary image pixels darker than this normalized value are treated as grain-boundary pixels.")
+        self.boundary_dilation_radius = self._spin(0, 20, 1, 0)
+        self.boundary_dilation_radius.setToolTip("Expands boundary pixels before cutting. Higher values cut more aggressively near boundaries.")
+        self.boundary_min_segment_pixels = self._spin(1, 10000, 1, 40)
+        self.boundary_min_segment_pixels.setToolTip("Discard cut event fragments smaller than this many pixels.")
+        self.boundary_connectivity = QComboBox()
+        self.boundary_connectivity.addItems(["1 - edge connected", "2 - edge/corner connected"])
+        self.boundary_connectivity.setCurrentIndex(1)
+        self.boundary_connectivity.setToolTip("Connectivity used to label event fragments after boundary pixels are removed.")
+        form.addRow("Event source", self.boundary_event_source)
+        form.addRow("Black threshold", self.boundary_black_threshold)
+        form.addRow("Boundary dilation", self.boundary_dilation_radius)
+        form.addRow("Min segment pixels", self.boundary_min_segment_pixels)
+        form.addRow("Connectivity", self.boundary_connectivity)
+        boundary_default = QPushButton("Set As Default")
+        boundary_default.setToolTip("Save current boundary-cut parameters as the default.")
+        boundary_default.clicked.connect(self._save_parameter_defaults)
+        form.addRow("", boundary_default)
+        control_layout.addLayout(form)
+
+        run_button = QPushButton("Run Boundary Cut")
+        run_button.setToolTip("Cut the selected current event set by the loaded EBSD boundary image.")
+        run_button.clicked.connect(self._run_boundary_cut)
+        control_layout.addWidget(run_button)
+
+        self.boundary_cut_progress = QLabel("Ready.")
+        self.boundary_cut_progress.setWordWrap(True)
+        self.boundary_cut_progress.setToolTip("Shows whether boundary cutting is idle, running, failed, or completed.")
+        self.boundary_cut_progress.setStyleSheet(
+            "padding: 8px; border-radius: 6px; background: #f9fafb; color: #374151;"
+        )
+        control_layout.addWidget(self.boundary_cut_progress)
+        self.boundary_cut_progress_bar = QProgressBar()
+        self.boundary_cut_progress_bar.setRange(0, 1)
+        self.boundary_cut_progress_bar.setValue(0)
+        self.boundary_cut_progress_bar.setTextVisible(True)
+        self.boundary_cut_progress_bar.setFormat("Ready")
+        control_layout.addWidget(self.boundary_cut_progress_bar)
+
+        self.boundary_cut_stats = QLabel("No boundary-cut result yet.")
+        self.boundary_cut_stats.setWordWrap(True)
+        self.boundary_cut_stats.setToolTip("After cutting, shows event counts, removed pixels, splits, and discarded small fragments.")
+        control_layout.addWidget(self.boundary_cut_stats)
+        legend = QLabel("Overlay: red = kept event pixels, blue = EBSD boundary, green = pixels removed by boundary cut.")
+        legend.setWordWrap(True)
+        legend.setToolTip("Colors used in the boundary-cut result overlay.")
+        control_layout.addWidget(legend)
         control_layout.addStretch(1)
 
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
         image_layout.setContentsMargins(0, 0, 0, 0)
-        image_label = QLabel("Detected Events")
-        image_label.setToolTip("Overlay image showing event pixels grown from Hough seeds.")
+        image_label = QLabel("Boundary Cut Overlay")
         image_label.setStyleSheet("font-weight: 700;")
         image_layout.addWidget(image_label)
-        self.trace_preview = ZoomImageView()
-        self.trace_preview.setMinimumSize(520, 420)
-        self.trace_preview.setToolTip("Detected event pixels are shown as an overlay. Use =/+ and - to zoom, 0 to fit, or mouse wheel to zoom.")
-        image_layout.addWidget(self.trace_preview, 1)
+        self.boundary_cut_preview = ZoomImageView()
+        self.boundary_cut_preview.setMinimumSize(520, 420)
+        self.boundary_cut_preview.setToolTip("Boundary-cut overlay. Use =/+ and - to zoom, 0 to fit, mouse wheel to zoom, and space-drag to pan.")
+        image_layout.addWidget(self.boundary_cut_preview, 1)
 
         layout.addWidget(controls)
         layout.addWidget(image_panel, 1)
-        self.tabs.addTab(tab, "Trace Events")
+        self.tabs.addTab(tab, "Boundary Cuts")
         self.tabs.setTabToolTip(
             self.tabs.indexOf(tab),
-            "Trace events from selected Hough seeds and inspect the detected-event overlay.",
+            "Cut current detected events using the EBSD boundary image from Project Files.",
         )
 
     def _scroll_tab(self) -> tuple[QScrollArea, QWidget]:
@@ -1095,44 +1380,79 @@ class AutoDetectionPanel(QWidget):
         scroll.setWidget(content)
         return scroll, content
 
-    def _choose_image(self) -> None:
-        start = str(Path(self._image_path).parent) if self._image_path else str(Path.cwd())
-        path, _selected = QFileDialog.getOpenFileName(
-            self,
-            "Choose BLN image",
-            start,
-            "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All Files (*)",
-        )
-        if path:
-            self._load_image_metadata(path)
+    def set_project_files(self, files: dict[str, str]) -> None:
+        self._project_files = dict(files)
+        self.alignment_analysis_panel.set_project_files(self._project_files)
+        self._refresh_boundary_file_summary()
+        bln_path = self._project_files.get("bln_image", "").strip()
+        if not bln_path:
+            self._image_path = None
+            self._summary = None
+            self.dimension_label.setText("Image: not loaded")
+            self._set_status_neutral("Load a BLN image in Project Files before using Auto Detection.")
+            self._clear_downstream()
+            self.crop_canvas.clear_image()
+            self.crop_preview.set_array(None)
+            return
+
+        expanded = str(Path(bln_path).expanduser())
+        if expanded == self._image_path:
+            return
+        if not Path(expanded).exists():
+            self._set_status_error(f"Project Files BLN image not found: {expanded}")
+            return
+        self._load_image_metadata(expanded)
+
+    def _set_boundary_cut_result(self, result: dict | None) -> None:
+        self._boundary_cut = result
+        self.alignment_analysis_panel.set_boundary_cut_result(result)
+
+    def _refresh_boundary_file_summary(self) -> None:
+        if not hasattr(self, "boundary_path_label"):
+            return
+        boundary_path = self._project_files.get("ebsd_boundary_image", "").strip()
+        if not boundary_path:
+            self.boundary_path_label.setText("Boundary image: not loaded")
+            self.boundary_path_label.setStyleSheet("color: #374151;")
+            return
+        path = Path(boundary_path).expanduser()
+        if not path.exists():
+            self.boundary_path_label.setText(f"Boundary image not found:\n{path}")
+            self.boundary_path_label.setStyleSheet("color: #b91c1c; font-weight: 700;")
+            return
+        try:
+            width, height = image_size(str(path))
+        except Exception:
+            self.boundary_path_label.setText(f"Boundary image selected:\n{path.name}")
+            self.boundary_path_label.setStyleSheet("color: #374151;")
+            return
+        self.boundary_path_label.setStyleSheet("color: #374151;")
+        self.boundary_path_label.setText(f"Boundary image: {path.name}\nDimension: {width} x {height} pixels")
 
     def _load_image_metadata(self, path: str) -> None:
         with busy_cursor():
-            self.status_label.setText("Loading image...")
+            self._set_status_neutral("Loading image...")
             try:
                 width, height = image_size(path)
                 self._summary = image_value_summary(path)
             except Exception as exc:  # pragma: no cover - UI safety path
-                self.status_label.setText(f"Could not load image: {exc}")
+                self._set_status_error(f"Could not load image: {exc}")
                 return
 
         self._image_path = path
         self.dimension_label.setText(f"Original dimension: {width} x {height} pixels")
-        self.status_label.setText(f"Loaded image: {width} x {height}.")
+        self._set_status_neutral(f"Loaded image: {width} x {height}.")
         display_min, display_max = default_display_range(self._summary)
+        self._display_base_range = (display_min, display_max)
         self._range_controls_updating = True
-        self.display_min.blockSignals(True)
-        self.display_max.blockSignals(True)
-        self.display_min_slider.blockSignals(True)
-        self.display_max_slider.blockSignals(True)
-        self.display_min.setValue(display_min)
-        self.display_max.setValue(display_max)
-        self._sync_range_sliders_from_spins()
-        self.display_min_slider.blockSignals(False)
-        self.display_max_slider.blockSignals(False)
-        self.display_min.blockSignals(False)
-        self.display_max.blockSignals(False)
+        self.display_brightness_slider.blockSignals(True)
+        self.display_contrast_slider.blockSignals(True)
+        self.display_brightness_slider.setValue(0)
+        self.display_contrast_slider.setValue(0)
+        self.display_brightness_slider.blockSignals(False)
+        self.display_contrast_slider.blockSignals(False)
         self._range_controls_updating = False
+        self._update_display_adjustment_labels()
         crop_size = min(500, width, height)
         self.crop_x.setMaximum(max(0, width - 1))
         self.crop_y.setMaximum(max(0, height - 1))
@@ -1144,16 +1464,18 @@ class AutoDetectionPanel(QWidget):
         self.crop_y.setValue(max(0, (height - crop_size) // 2))
         self._clear_downstream()
         self._refresh_crop_canvas()
+        self._refresh_crop_preview()
         self._run_region()
-        self._update_default_trace_prefix()
 
     def _params(self) -> AutoPipelineParams:
         if not self._image_path:
             raise ValueError("No BLN image is loaded.")
+        display_min, display_max = self._current_display_range()
         return AutoPipelineParams(
             image_path=self._image_path,
-            display_min=float(self.display_min.value()),
-            display_max=float(self.display_max.value()),
+            display_min=float(display_min),
+            display_max=float(display_max),
+            display_brightness=self._display_slider_value(self.display_brightness_slider),
             use_full_image=bool(self.use_full_image.isChecked()),
             crop_x=int(self.crop_x.value()),
             crop_y=int(self.crop_y.value()),
@@ -1165,7 +1487,7 @@ class AutoDetectionPanel(QWidget):
             threshold_multiplier=float(self.threshold_multiplier.value()),
             min_object_size=int(self.min_object_size.value()),
             closing_radius=int(self.closing_radius.value()),
-            use_skeletonize=bool(self.use_skeletonize.isChecked()),
+            use_skeletonize=True,
             hough_threshold=int(self.hough_threshold.value()),
             hough_line_length=int(self.hough_line_length.value()),
             hough_line_gap=int(self.hough_line_gap.value()),
@@ -1179,93 +1501,268 @@ class AutoDetectionPanel(QWidget):
             duplicate_overlap=float(self.duplicate_overlap.value()),
             merge_distance_tolerance=float(self.merge_distance.value()),
             merge_angle_tolerance=float(self.merge_angle.value()),
-            connect_merged_event_gaps=bool(self.connect_gaps.isChecked()),
+            connect_merged_event_gaps=False,
         )
 
     def _run_region(self) -> None:
         try:
             self._region = load_region(self._params())
         except Exception as exc:  # pragma: no cover - UI safety path
-            self.status_label.setText(f"Region load failed: {exc}")
+            self._set_status_error(f"Region load failed: {exc}")
             return
         origin = self._region["origin"]
         height, width = self._region["display_rgb"].shape[:2]
-        self.status_label.setText(f"Loaded region at x={origin[0]}, y={origin[1]}, size {width} x {height}.")
+        self._set_status_neutral(f"Loaded region at x={origin[0]}, y={origin[1]}, size {width} x {height}.")
         self._preprocess = None
         self._preprocess_preview = None
         self._hough = None
+        self._mask = None
         self._trace = None
+        self._set_boundary_cut_result(None)
         self._show_display_stage()
-        self._update_default_trace_prefix()
 
     def _run_preprocessing(self) -> None:
         with busy_cursor():
             try:
                 self._preprocess_preview = run_preprocessing_preview(self._params())
             except Exception as exc:  # pragma: no cover - UI safety path
-                self.status_label.setText(f"Preprocessing failed: {exc}")
+                self._set_status_error(f"Preprocessing failed: {exc}")
                 return
-        self.status_label.setText("Preprocessing preview updated.")
+        self._set_status_neutral("Preprocessing preview updated.")
         self._preprocess = None
         self._hough = None
+        self._mask = None
         self._trace = None
+        self._set_boundary_cut_result(None)
         self._show_display_stage()
 
-    def _run_hough(self) -> None:
+    def _run_hough(self, switch_to_seed_view: bool = True) -> bool:
         started = time.perf_counter()
-        self.hough_progress.setText("Processing Hough lines and seeds...")
+        self._set_label_neutral(self.hough_progress, "Processing Hough lines and seeds...")
+        self._set_progress_value(self.hough_progress_bar, 5, "Starting...")
         self.hough_stats.setText("")
-        self.status_label.setText("Processing Hough lines and seeds...")
+        self._set_status_neutral("Processing Hough lines and seeds...")
         QApplication.processEvents()
         with busy_cursor():
             try:
                 self._preprocess = run_preprocessing(self._params())
+                self._set_progress_value(self.hough_progress_bar, 45, "Preprocessing done")
             except Exception as exc:  # pragma: no cover - UI safety path
-                self.status_label.setText(f"Full-resolution preprocessing failed: {exc}")
-                self.hough_progress.setText("Processing failed during full-resolution preprocessing.")
-                return
+                self._set_status_error(f"Full-resolution preprocessing failed: {exc}")
+                self._set_label_error(self.hough_progress, "Processing failed during full-resolution preprocessing.")
+                self._set_progress_failed(self.hough_progress_bar)
+                return False
             try:
+                self._set_progress_value(self.hough_progress_bar, 55, "Detecting seeds...")
                 self._hough = run_hough_seed_detection(self._preprocess, self._params())
+                self._set_progress_value(self.hough_progress_bar, 90, "Rendering overlay...")
             except Exception as exc:  # pragma: no cover - UI safety path
-                self.status_label.setText(f"Hough seed detection failed: {exc}")
-                self.hough_progress.setText("Processing failed during Hough seed detection.")
-                return
+                self._set_status_error(f"Hough seed detection failed: {exc}")
+                self._set_label_error(self.hough_progress, "Processing failed during Hough seed detection.")
+                self._set_progress_failed(self.hough_progress_bar)
+                return False
         elapsed = time.perf_counter() - started
         if self.hough_use_all_seeds.isChecked():
             self.hough_max_seeds.setMaximum(max(1, self._hough["candidate_seed_count"]))
             self.hough_max_seeds.setValue(max(1, self._hough["candidate_seed_count"]))
         self.hough_preview.set_array(self._hough["overlay"])
+        if switch_to_seed_view:
+            self.hough_result_tabs.setCurrentIndex(0)
         self.hough_stats.setText(
             f"Detected Hough lines: {self._hough['raw_count']:,}\n"
             f"Hough seed candidates: {self._hough['candidate_seed_count']:,}\n"
             f"Selected seeds: {len(self._hough['seeds']):,}"
         )
-        self.hough_progress.setText(f"Processed in {elapsed:.2f} seconds.")
-        self.status_label.setText(f"Hough line and seed detection complete in {elapsed:.2f} seconds.")
+        self._set_label_neutral(self.hough_progress, f"Processed in {elapsed:.2f} seconds.")
+        self._set_progress_complete(self.hough_progress_bar)
+        self._set_status_neutral(f"Hough line and seed detection complete in {elapsed:.2f} seconds.")
         self._trace = None
+        self._set_boundary_cut_result(None)
+        return True
 
-    def _run_trace(self) -> None:
+    def _run_mask_events(self) -> None:
         started = time.perf_counter()
-        self.trace_progress.setText("Tracing events from Hough seeds...")
-        self.trace_stats.setText("")
-        self.status_label.setText("Tracing events from Hough seeds...")
+        self._set_label_neutral(self.mask_progress, "Processing mask events...")
+        self._set_progress_value(self.mask_progress_bar, 5, "Starting...")
+        self.mask_stats.setText("")
+        self._set_status_neutral("Processing mask events...")
         QApplication.processEvents()
         with busy_cursor():
-            if self._hough is None:
-                self.trace_progress.setText("Hough seeds missing. Running Hough Step 1 first...")
-                QApplication.processEvents()
-                self._run_hough()
-            if self._preprocess is None or self._hough is None:
-                self.trace_progress.setText("Trace could not start because Hough seeds are unavailable.")
+            try:
+                self._preprocess = run_preprocessing(self._params())
+                self._set_progress_value(self.mask_progress_bar, 55, "Preprocessing done")
+            except Exception as exc:  # pragma: no cover - UI safety path
+                self._set_status_error(f"Full-resolution common preprocessing failed: {exc}")
+                self._set_label_error(self.mask_progress, "Processing failed during full-resolution common preprocessing.")
+                self._set_progress_failed(self.mask_progress_bar)
                 return
             try:
-                self._trace = trace_hough_events(self._preprocess, self._hough, self._params())
+                self._set_progress_value(self.mask_progress_bar, 70, "Labeling mask events...")
+                self._mask = run_mask_event_detection(self._preprocess, self._params())
+                self._set_progress_value(self.mask_progress_bar, 90, "Rendering overlay...")
             except Exception as exc:  # pragma: no cover - UI safety path
-                self.status_label.setText(f"Event tracing failed: {exc}")
-                self.trace_progress.setText("Event tracing failed.")
+                self._set_status_error(f"Mask event detection failed: {exc}")
+                self._set_label_error(self.mask_progress, "Processing failed during mask event detection.")
+                self._set_progress_failed(self.mask_progress_bar)
                 return
         elapsed = time.perf_counter() - started
-        self.trace_preview.set_array(downsample_rgb_for_view(self._trace["overlay"]))
+        self.detection_tabs.setCurrentIndex(0)
+        self.mask_preview.set_array(downsample_rgb_for_view(self._mask["overlay"]))
+        total_pixels = sum(line.size for line in self._mask["accepted"])
+        self.mask_stats.setText(
+            f"Connected mask components: {self._mask['component_count']:,}\n"
+            f"Accepted mask events: {self._mask['accepted_count']:,}\n"
+            f"Event pixels: {total_pixels:,}"
+        )
+        self._set_label_neutral(self.mask_progress, f"Processed in {elapsed:.2f} seconds.")
+        self._set_progress_complete(self.mask_progress_bar)
+        self._set_status_neutral(f"Mask event detection complete in {elapsed:.2f} seconds.")
+        self._set_boundary_cut_result(None)
+
+    def _run_boundary_cut(self) -> None:
+        boundary_path = self._project_files.get("ebsd_boundary_image", "").strip()
+        if not boundary_path:
+            self._set_notice_error(self.boundary_cut_progress, "Load an EBSD boundary image in Project Files first.")
+            self._set_progress_failed(self.boundary_cut_progress_bar)
+            return
+        boundary_path = str(Path(boundary_path).expanduser())
+        if not Path(boundary_path).exists():
+            self._set_notice_error(self.boundary_cut_progress, f"Boundary image not found: {boundary_path}")
+            self._set_progress_failed(self.boundary_cut_progress_bar)
+            return
+        if self._preprocess is None:
+            self._set_notice_error(self.boundary_cut_progress, "Run Detection before boundary cutting.")
+            self._set_progress_failed(self.boundary_cut_progress_bar)
+            return
+
+        source_is_mask = self.boundary_event_source.currentText().startswith("Mask")
+        event_result = self._mask if source_is_mask else self._trace
+        source_label = "Mask events" if source_is_mask else "Hough filled events"
+        if event_result is None:
+            self._set_notice_error(self.boundary_cut_progress, f"{source_label} are not available yet.")
+            self._set_progress_failed(self.boundary_cut_progress_bar)
+            return
+
+        started = time.perf_counter()
+        self._set_notice_neutral(self.boundary_cut_progress, f"Cutting {source_label.lower()} by EBSD boundary...")
+        self._set_boundary_cut_result(None)
+        self.boundary_cut_stats.setText("")
+        self._set_status_neutral("Running boundary cut...")
+        self._set_progress_value(self.boundary_cut_progress_bar, 10, "Loading boundary...")
+        QApplication.processEvents()
+        with busy_cursor():
+            try:
+                self._set_progress_value(self.boundary_cut_progress_bar, 35, "Cutting events...")
+                self._set_boundary_cut_result(run_boundary_cut_events(
+                    self._preprocess,
+                    event_result,
+                    boundary_path,
+                    black_threshold=float(self.boundary_black_threshold.value()),
+                    boundary_dilation_radius=int(self.boundary_dilation_radius.value()),
+                    min_segment_pixels=int(self.boundary_min_segment_pixels.value()),
+                    connectivity=1 if self.boundary_connectivity.currentIndex() == 0 else 2,
+                ))
+                self._set_progress_value(self.boundary_cut_progress_bar, 90, "Rendering overlay...")
+            except Exception as exc:  # pragma: no cover - UI safety path
+                self._set_status_error(f"Boundary cut failed: {exc}")
+                self._set_notice_error(self.boundary_cut_progress, f"Boundary cut failed: {exc}")
+                self._set_progress_failed(self.boundary_cut_progress_bar)
+                return
+
+        elapsed = time.perf_counter() - started
+        self.boundary_cut_preview.set_array(
+            downsample_rgb_for_view(
+                self._boundary_cut["overlay"],
+                resample=Image.Resampling.NEAREST,
+            )
+        )
+        self.boundary_cut_stats.setText(
+            f"Source events: {self._boundary_cut['source_count']:,}\n"
+            f"Cut events: {self._boundary_cut['accepted_count']:,}\n"
+            f"Source pixels: {self._boundary_cut['source_pixel_count']:,}\n"
+            f"Kept pixels: {self._boundary_cut['kept_pixel_count']:,}\n"
+            f"Removed boundary pixels: {self._boundary_cut['removed_pixel_count']:,}\n"
+            f"Events touching boundary: {self._boundary_cut['events_touching_boundary']:,}\n"
+            f"Events split: {self._boundary_cut['events_split']:,}\n"
+            f"Discarded small segments: {self._boundary_cut['discarded_small_segments']:,}\n"
+            f"Boundary pixels in crop: {self._boundary_cut['boundary_pixel_count']:,}"
+        )
+        if self._boundary_cut["removed_pixel_count"] == 0:
+            if self._boundary_cut["boundary_pixel_count"] == 0:
+                self._set_notice_neutral(
+                    self.boundary_cut_progress,
+                    f"Processed in {elapsed:.2f} seconds. No boundary pixels were found in the selected crop."
+                )
+            else:
+                self._set_notice_neutral(
+                    self.boundary_cut_progress,
+                    f"Processed in {elapsed:.2f} seconds. Boundary pixels did not overlap event pixels."
+                )
+        else:
+            self._set_notice_success(self.boundary_cut_progress, f"Processed in {elapsed:.2f} seconds.")
+        self._set_progress_complete(self.boundary_cut_progress_bar)
+        self._set_status_neutral(f"Boundary cut complete in {elapsed:.2f} seconds.")
+
+    def _run_trace(self) -> None:
+        if self._trace_thread is not None:
+            self._set_label_neutral(self.trace_progress, "Step 2 is already running.")
+            return
+        self._set_label_neutral(self.trace_progress, "Tracing events from Hough seeds...")
+        self._set_progress_value(self.trace_progress_bar, 5, "Starting...")
+        self.trace_stats.setText("")
+        self._set_status_neutral("Tracing events from Hough seeds...")
+        self.detection_tabs.setCurrentIndex(1)
+        self.hough_result_tabs.setCurrentIndex(1)
+        self._sync_hough_step_controls(1)
+        QApplication.processEvents()
+
+        if self._hough is None:
+            self._set_label_neutral(self.trace_progress, "Hough seeds missing. Running Hough Step 1 first...")
+            self._set_progress_value(self.trace_progress_bar, 10, "Running Step 1 first...")
+            QApplication.processEvents()
+            if not self._run_hough(switch_to_seed_view=False):
+                self._set_label_error(self.trace_progress, "Trace could not start because Hough Step 1 failed.")
+                self._set_progress_failed(self.trace_progress_bar)
+                return
+            self.detection_tabs.setCurrentIndex(1)
+            self.hough_result_tabs.setCurrentIndex(1)
+            self._sync_hough_step_controls(1)
+            self._set_progress_value(self.trace_progress_bar, 30, "Step 1 ready")
+
+        if self._preprocess is None or self._hough is None:
+            self._set_label_error(self.trace_progress, "Trace could not start because Hough seeds are unavailable.")
+            self._set_progress_failed(self.trace_progress_bar)
+            return
+
+        self.trace_button.setEnabled(False)
+        self._trace_thread = QThread(self)
+        self._trace_worker = TraceEventsWorker(self._preprocess, self._hough, self._params())
+        self._trace_worker.moveToThread(self._trace_thread)
+        self._trace_thread.started.connect(self._trace_worker.run)
+        self._trace_worker.progress.connect(self._trace_progress_from_worker)
+        self._trace_worker.finished.connect(self._trace_finished)
+        self._trace_worker.failed.connect(self._trace_failed)
+        self._trace_worker.finished.connect(self._trace_worker.deleteLater)
+        self._trace_worker.failed.connect(self._trace_worker.deleteLater)
+        self._trace_worker.finished.connect(self._trace_thread.quit)
+        self._trace_worker.failed.connect(self._trace_thread.quit)
+        self._trace_thread.finished.connect(self._trace_thread_finished)
+        self._trace_thread.start()
+
+    @Slot(int, str)
+    def _trace_progress_from_worker(self, value: int, text: str) -> None:
+        if value < 0:
+            self._set_progress_busy(self.trace_progress_bar, text)
+        else:
+            self._set_progress_value(self.trace_progress_bar, value, text)
+        self._set_label_neutral(self.trace_progress, text)
+        self._set_status_neutral(text)
+
+    @Slot(object, float)
+    def _trace_finished(self, result: object, elapsed: float) -> None:
+        self._trace = result
+        self._set_boundary_cut_result(None)
+        self.trace_preview.set_array(self._trace["overlay"])
         total_pixels = sum(line.size for line in self._trace["accepted"])
         self.trace_stats.setText(
             f"Detected events: {self._trace['accepted_count']:,}\n"
@@ -1273,183 +1770,79 @@ class AutoDetectionPanel(QWidget):
             f"Merged groups: {self._trace['merged']:,}\n"
             f"Event pixels: {total_pixels:,}"
         )
-        self.trace_progress.setText(f"Processed in {elapsed:.2f} seconds.")
-        self.status_label.setText(f"Event tracing complete in {elapsed:.2f} seconds.")
-        self._update_default_trace_prefix()
+        self._set_label_neutral(self.trace_progress, f"Processed in {elapsed:.2f} seconds.")
+        self._set_progress_complete(self.trace_progress_bar)
+        self._set_status_neutral(f"Event tracing complete in {elapsed:.2f} seconds.")
 
-    def _default_trace_prefix(self) -> str:
-        if not self._image_path:
-            return "hough_events"
-        image_stem = Path(self._image_path).stem
-        return (
-            f"{image_stem}_hough_"
-            f"x{int(self.crop_x.value())}_y{int(self.crop_y.value())}_"
-            f"w{int(self.crop_width.value())}_h{int(self.crop_height.value())}"
-        )
+    @Slot(str)
+    def _trace_failed(self, message: str) -> None:
+        self._set_status_error(f"Event tracing failed: {message}")
+        self._set_label_error(self.trace_progress, "Event tracing failed.")
+        self._set_progress_failed(self.trace_progress_bar)
 
-    def _update_default_trace_prefix(self) -> None:
-        if not hasattr(self, "trace_save_prefix"):
-            return
-        if not self.trace_save_prefix.text().strip():
-            self.trace_save_prefix.setText(self._default_trace_prefix())
+    @Slot()
+    def _trace_thread_finished(self) -> None:
+        if self._trace_thread is not None:
+            self._trace_thread.deleteLater()
+        self._trace_worker = None
+        self._trace_thread = None
+        self.trace_button.setEnabled(True)
 
-    def _save_trace_events(self) -> None:
-        if self._trace is None or self._preprocess is None:
-            self.trace_save_status.setText("Run Trace Events before saving.")
-            return
-        safe_prefix = sanitize_file_prefix(self.trace_save_prefix.text())
-        if not safe_prefix:
-            self.trace_save_status.setText("Enter a file prefix before saving.")
-            return
+    def _reset_display_adjustments(self) -> None:
+        self._range_controls_updating = True
+        self.display_brightness_slider.blockSignals(True)
+        self.display_contrast_slider.blockSignals(True)
+        self.display_brightness_slider.setValue(0)
+        self.display_contrast_slider.setValue(0)
+        self.display_brightness_slider.blockSignals(False)
+        self.display_contrast_slider.blockSignals(False)
+        self._range_controls_updating = False
+        self._update_display_adjustment_labels()
+        self._refresh_crop_display()
 
-        out_dir = Path(__file__).resolve().parents[2] / "tests" / "outputs" / "hough_events"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        events_path = out_dir / f"{safe_prefix}_events.csv"
-        pixels_path = out_dir / f"{safe_prefix}_event_pixels.csv"
-        crop_x, crop_y = self._preprocess["crop"]["origin"]
-        created_at = datetime.now().astimezone().isoformat(timespec="seconds")
-
-        event_rows: list[dict] = []
-        pixel_rows: list[dict] = []
-        assigned_pixels: set[tuple[int, int]] = set()
-        duplicate_pixel_count = 0
-        skipped_event_count = 0
-        saved_event_index = 0
-
-        for line in self._trace["accepted"]:
-            unique_points: list[tuple[int, int]] = []
-            for point in sorted(line.points, key=lambda p: (p.y, p.x)):
-                global_pixel = (crop_x + int(point.x), crop_y + int(point.y))
-                if global_pixel in assigned_pixels:
-                    duplicate_pixel_count += 1
-                    continue
-                assigned_pixels.add(global_pixel)
-                unique_points.append(global_pixel)
-            if not unique_points:
-                skipped_event_count += 1
-                continue
-
-            saved_event_index += 1
-            event_id = f"{safe_prefix}_{saved_event_index:04d}"
-            event_rows.append(
-                {
-                    "event_id": event_id,
-                    "method": "hough",
-                    "num_pixels": len(unique_points),
-                    "crop_x": crop_x,
-                    "crop_y": crop_y,
-                    "image_path": self._image_path,
-                    "created_at": created_at,
-                }
-            )
-            for pixel_x, pixel_y in unique_points:
-                pixel_rows.append(
-                    {
-                        "event_id": event_id,
-                        "pixel_x": pixel_x,
-                        "pixel_y": pixel_y,
-                    }
-                )
-
-        with busy_cursor():
-            with events_path.open("w", newline="") as events_file:
-                writer = csv.DictWriter(
-                    events_file,
-                    fieldnames=[
-                        "event_id",
-                        "method",
-                        "num_pixels",
-                        "crop_x",
-                        "crop_y",
-                        "image_path",
-                        "created_at",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerows(event_rows)
-            with pixels_path.open("w", newline="") as pixels_file:
-                writer = csv.DictWriter(
-                    pixels_file,
-                    fieldnames=["event_id", "pixel_x", "pixel_y"],
-                )
-                writer.writeheader()
-                writer.writerows(pixel_rows)
-
-        detail = (
-            f"Saved {len(event_rows)} events and {len(pixel_rows)} unique pixels.\n"
-            f"{events_path}\n{pixels_path}"
-        )
-        if duplicate_pixel_count:
-            detail += f"\nRemoved {duplicate_pixel_count} duplicate shared pixels."
-        if skipped_event_count:
-            detail += f"\nSkipped {skipped_event_count} duplicate-only events."
-        self.trace_save_status.setText(detail)
-        self.status_label.setText("Detected events saved.")
-
-    def _set_auto_range(self) -> None:
-        if not self._summary:
-            return
-        self.display_min.setValue(self._summary["p0_5"])
-        self.display_max.setValue(self._summary["p99_5"])
-
-    def _set_reset_range(self) -> None:
-        if not self._summary:
-            return
-        self.display_min.setValue(self._summary["min"])
-        self.display_max.setValue(self._summary["max"])
-
-    def _display_spin_changed(self) -> None:
+    def _display_adjustment_changed(self) -> None:
         if self._range_controls_updating:
             return
-        self._range_controls_updating = True
-        self.display_min_slider.blockSignals(True)
-        self.display_max_slider.blockSignals(True)
-        self._sync_range_sliders_from_spins()
-        self.display_min_slider.blockSignals(False)
-        self.display_max_slider.blockSignals(False)
-        self._range_controls_updating = False
+        self._update_display_adjustment_labels()
         self._refresh_crop_display()
 
-    def _display_slider_changed(self) -> None:
-        if self._range_controls_updating or not self._summary:
-            return
-        raw_min = self._summary["min"]
-        raw_max = self._summary["max"]
-        span = raw_max - raw_min
-        if span <= 0:
-            return
-        min_value = raw_min + span * (self.display_min_slider.value() / 1000.0)
-        max_value = raw_min + span * (self.display_max_slider.value() / 1000.0)
-        if max_value <= min_value:
-            sender = self.sender()
-            if sender is self.display_min_slider:
-                max_value = min(raw_max, min_value + span / 1000.0)
-            else:
-                min_value = max(raw_min, max_value - span / 1000.0)
-        self._range_controls_updating = True
-        self.display_min.blockSignals(True)
-        self.display_max.blockSignals(True)
-        self.display_min.setValue(min_value)
-        self.display_max.setValue(max_value)
-        self.display_min.blockSignals(False)
-        self.display_max.blockSignals(False)
-        self._range_controls_updating = False
-        self._refresh_crop_display()
-
-    def _sync_range_sliders_from_spins(self) -> None:
+    def _current_display_range(self) -> tuple[float, float]:
         if not self._summary:
+            return 0.0, 1.0
+        return display_range_from_adjustments(
+            self._display_base_range,
+            self._display_slider_value(self.display_contrast_slider),
+            self._summary["min"],
+            self._summary["max"],
+        )
+
+    def _display_slider_value(self, slider: QSlider) -> float:
+        return float(slider.value()) / DISPLAY_ADJUSTMENT_SCALE
+
+    def _nudge_display_adjustment(self, slider: QSlider, delta: float) -> None:
+        step = int(round(float(delta) * DISPLAY_ADJUSTMENT_SCALE))
+        next_value = max(slider.minimum(), min(slider.maximum(), slider.value() + step))
+        slider.setValue(next_value)
+
+    def _update_display_adjustment_labels(self) -> None:
+        if not self._summary:
+            self.display_stats_label.setText("Raw range: -")
+            self.display_brightness_label.setText("Brightness: +0")
+            self.display_contrast_label.setText("Contrast: +0")
+            self.display_range_label.setText("Display window: -")
             return
-        raw_min = self._summary["min"]
-        raw_max = self._summary["max"]
-        span = raw_max - raw_min
-        if span <= 0:
-            self.display_min_slider.setValue(0)
-            self.display_max_slider.setValue(1000)
-            return
-        min_pos = int(round((self.display_min.value() - raw_min) / span * 1000.0))
-        max_pos = int(round((self.display_max.value() - raw_min) / span * 1000.0))
-        self.display_min_slider.setValue(max(0, min(1000, min_pos)))
-        self.display_max_slider.setValue(max(0, min(1000, max_pos)))
+        brightness = self._display_slider_value(self.display_brightness_slider)
+        contrast = self._display_slider_value(self.display_contrast_slider)
+        display_min, display_max = self._current_display_range()
+        self.display_stats_label.setText(
+            f"Raw min/max: {self._summary['min']:.4g} / {self._summary['max']:.4g}\n"
+            f"Auto low/high: {self._summary['p0_5']:.4g} / {self._summary['p99_5']:.4g}"
+        )
+        self.display_brightness_label.setText(f"Brightness: {brightness:+.1f}")
+        self.display_contrast_label.setText(f"Contrast: {contrast:+.1f}")
+        self.display_range_label.setText(
+            f"Display window: {display_min:.4g} to {display_max:.4g}"
+        )
 
     def _update_crop_enabled(self) -> None:
         enabled = not self.use_full_image.isChecked()
@@ -1467,27 +1860,185 @@ class AutoDetectionPanel(QWidget):
     def _sync_max_seed_enabled(self) -> None:
         self.hough_max_seeds.setEnabled(not self.hough_use_all_seeds.isChecked())
 
+    def _sync_hough_step_controls(self, index: int) -> None:
+        if hasattr(self, "hough_controls_stack"):
+            self.hough_controls_stack.setCurrentIndex(1 if index == 1 else 0)
+
+    def _set_progress_value(self, progress: QProgressBar, value: int, text: str) -> None:
+        progress.setRange(0, 100)
+        progress.setValue(max(0, min(100, int(value))))
+        progress.setFormat(f"{text} %p%")
+        QApplication.processEvents()
+
+    def _set_progress_busy(self, progress: QProgressBar, text: str) -> None:
+        progress.setRange(0, 0)
+        progress.setFormat(text)
+        QApplication.processEvents()
+
+    def _set_progress_complete(self, progress: QProgressBar) -> None:
+        progress.setRange(0, 100)
+        progress.setValue(100)
+        progress.setFormat("Complete")
+        QApplication.processEvents()
+
+    def _set_progress_failed(self, progress: QProgressBar) -> None:
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        progress.setFormat("Failed")
+        QApplication.processEvents()
+
+    def _set_notice_neutral(self, label: QLabel, text: str) -> None:
+        label.setText(text)
+        label.setStyleSheet(
+            "padding: 8px; border-radius: 6px; background: #f9fafb; color: #374151;"
+        )
+
+    def _set_notice_success(self, label: QLabel, text: str) -> None:
+        label.setText(text)
+        label.setStyleSheet(
+            "padding: 8px; border-radius: 6px; background: #dcfce7; color: #14532d;"
+        )
+
+    def _set_notice_error(self, label: QLabel, text: str) -> None:
+        label.setText(text)
+        label.setStyleSheet(
+            "padding: 8px; border-radius: 6px; background: #fee2e2; color: #7f1d1d; font-weight: 700;"
+        )
+
+    def _set_status_error(self, text: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: #b91c1c; font-weight: 700;")
+
+    def _set_status_neutral(self, text: str) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: #374151;")
+
+    @staticmethod
+    def _set_label_error(label: QLabel, text: str) -> None:
+        label.setText(text)
+        label.setStyleSheet("color: #b91c1c; font-weight: 700;")
+
+    @staticmethod
+    def _set_label_neutral(label: QLabel, text: str) -> None:
+        label.setText(text)
+        label.setStyleSheet("color: #374151;")
+
+    def _current_parameter_defaults(self) -> dict:
+        return {
+            "display_brightness": int(self.display_brightness_slider.value()),
+            "display_contrast": int(self.display_contrast_slider.value()),
+            "clahe_clip": float(self.clahe_clip.value()),
+            "ridge_sigma_max": int(self.ridge_sigma_max.value()),
+            "ridge_percentile": float(self.ridge_percentile.value()),
+            "threshold_multiplier": float(self.threshold_multiplier.value()),
+            "min_object_size": int(self.min_object_size.value()),
+            "closing_radius": int(self.closing_radius.value()),
+            "hough_threshold": int(self.hough_threshold.value()),
+            "hough_line_length": int(self.hough_line_length.value()),
+            "hough_line_gap": int(self.hough_line_gap.value()),
+            "hough_seed_spacing": int(self.hough_seed_spacing.value()),
+            "hough_use_all_seeds": bool(self.hough_use_all_seeds.isChecked()),
+            "hough_max_seeds": int(self.hough_max_seeds.value()),
+            "intensity_tolerance": int(self.intensity_tolerance.value()),
+            "bfl_tolerance": float(self.bfl_tolerance.value()),
+            "min_intensity": int(self.min_intensity.value()),
+            "min_points": int(self.min_points.value()),
+            "duplicate_overlap": float(self.duplicate_overlap.value()),
+            "merge_distance": float(self.merge_distance.value()),
+            "merge_angle": float(self.merge_angle.value()),
+            "boundary_event_source": self.boundary_event_source.currentText(),
+            "boundary_black_threshold": float(self.boundary_black_threshold.value()),
+            "boundary_dilation_radius": int(self.boundary_dilation_radius.value()),
+            "boundary_min_segment_pixels": int(self.boundary_min_segment_pixels.value()),
+            "boundary_connectivity": self.boundary_connectivity.currentIndex(),
+        }
+
+    def _save_parameter_defaults(self) -> None:
+        try:
+            with AUTO_PARAMETER_DEFAULTS_PATH.open("w", encoding="utf-8") as handle:
+                json.dump(self._current_parameter_defaults(), handle, indent=2)
+        except Exception as exc:
+            self._set_status_error(f"Could not save auto-detection defaults: {exc}")
+            return
+        self._set_status_neutral("Saved auto-detection parameter defaults.")
+
+    def _load_parameter_defaults(self) -> None:
+        if not AUTO_PARAMETER_DEFAULTS_PATH.exists():
+            return
+        try:
+            with AUTO_PARAMETER_DEFAULTS_PATH.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            return
+        self._range_controls_updating = True
+        for widget_name, key in [
+            ("display_brightness_slider", "display_brightness"),
+            ("display_contrast_slider", "display_contrast"),
+            ("clahe_clip", "clahe_clip"),
+            ("ridge_sigma_max", "ridge_sigma_max"),
+            ("ridge_percentile", "ridge_percentile"),
+            ("threshold_multiplier", "threshold_multiplier"),
+            ("min_object_size", "min_object_size"),
+            ("closing_radius", "closing_radius"),
+            ("hough_threshold", "hough_threshold"),
+            ("hough_line_length", "hough_line_length"),
+            ("hough_line_gap", "hough_line_gap"),
+            ("hough_seed_spacing", "hough_seed_spacing"),
+            ("hough_max_seeds", "hough_max_seeds"),
+            ("intensity_tolerance", "intensity_tolerance"),
+            ("bfl_tolerance", "bfl_tolerance"),
+            ("min_intensity", "min_intensity"),
+            ("min_points", "min_points"),
+            ("duplicate_overlap", "duplicate_overlap"),
+            ("merge_distance", "merge_distance"),
+            ("merge_angle", "merge_angle"),
+            ("boundary_black_threshold", "boundary_black_threshold"),
+            ("boundary_dilation_radius", "boundary_dilation_radius"),
+            ("boundary_min_segment_pixels", "boundary_min_segment_pixels"),
+        ]:
+            if key in data:
+                getattr(self, widget_name).setValue(data[key])
+        self._range_controls_updating = False
+        if "hough_use_all_seeds" in data:
+            self.hough_use_all_seeds.setChecked(bool(data["hough_use_all_seeds"]))
+        source = data.get("boundary_event_source")
+        if source:
+            index = self.boundary_event_source.findText(str(source))
+            if index >= 0:
+                self.boundary_event_source.setCurrentIndex(index)
+        if "boundary_connectivity" in data:
+            self.boundary_connectivity.setCurrentIndex(int(data["boundary_connectivity"]))
+        self._sync_max_seed_enabled()
+        self._update_display_adjustment_labels()
+        self._clahe_spin_changed()
+
     def _clear_downstream(self) -> None:
         self._region = None
         self._preprocess = None
         self._preprocess_preview = None
         self._hough = None
+        self._mask = None
         self._trace = None
-        for preview in (self.display_preview, self.hough_preview, self.trace_preview):
+        self._set_boundary_cut_result(None)
+        for preview in (self.display_preview, self.hough_preview, self.mask_preview, self.trace_preview, self.boundary_cut_preview):
             preview.set_array(None)
+        if hasattr(self, "crop_preview"):
+            self.crop_preview.set_array(None)
 
     def _refresh_crop_canvas(self) -> None:
         if not self._image_path:
             return
         with busy_cursor():
             try:
+                display_min, display_max = self._current_display_range()
                 preview_rgb, scale_x, scale_y = load_downsampled_preview(
                     self._image_path,
-                    float(self.display_min.value()),
-                    float(self.display_max.value()),
+                    float(display_min),
+                    float(display_max),
+                    self._display_slider_value(self.display_brightness_slider),
                 )
             except Exception as exc:
-                self.status_label.setText(f"Could not show crop image: {exc}")
+                self._set_status_error(f"Could not show crop image: {exc}")
                 return
         self.crop_canvas.set_image(
             preview_rgb,
@@ -1501,6 +2052,18 @@ class AutoDetectionPanel(QWidget):
             int(self.crop_width.value()),
             int(self.crop_height.value()),
         )
+
+    def _refresh_crop_preview(self) -> None:
+        if not self._image_path or not hasattr(self, "crop_preview"):
+            return
+        with busy_cursor():
+            try:
+                preview_region = load_downsampled_processing_region(self._params(), max_dim=1400)
+            except Exception as exc:
+                self._set_status_error(f"Could not show selected crop preview: {exc}")
+                self.crop_preview.set_array(None)
+                return
+        self.crop_preview.set_array(preview_region["display_rgb"])
 
     def _set_crop_from_canvas(self, x: int, y: int, width: int, height: int) -> None:
         if self._image_path:
@@ -1538,14 +2101,31 @@ class AutoDetectionPanel(QWidget):
 
     def _refresh_from_region_change(self) -> None:
         if self._image_path:
+            self._refresh_crop_preview()
             self._run_region()
 
     def _refresh_crop_display(self) -> None:
         if not self._image_path:
             return
         self._refresh_crop_canvas()
+        self._refresh_crop_preview()
+        self._region = None
+        self._preprocess = None
         self._preprocess_preview = None
-        self._run_region()
+        self._hough = None
+        self._mask = None
+        self._trace = None
+        self._set_boundary_cut_result(None)
+        for preview in (self.hough_preview, self.mask_preview, self.trace_preview, self.boundary_cut_preview):
+            preview.set_array(None)
+        if self._display_stage == "original":
+            try:
+                preview_region = load_downsampled_processing_region(self._params())
+            except Exception as exc:
+                self._set_status_error(f"Could not update brightness/contrast preview: {exc}")
+                self.display_preview.set_array(None)
+            else:
+                self.display_preview.set_array(preview_region["display_rgb"])
 
     def _set_display_stage(self, stage: str) -> None:
         self._display_stage = stage
@@ -1554,7 +2134,7 @@ class AutoDetectionPanel(QWidget):
         self._refresh_display()
 
     def _update_stage_options(self) -> None:
-        if not hasattr(self, "clahe_options"):
+        if not hasattr(self, "option_stack"):
             return
         self._update_stage_buttons()
         stage_indices = {
@@ -1562,7 +2142,6 @@ class AutoDetectionPanel(QWidget):
             "clahe": 1,
             "ridge": 2,
             "clean": 3,
-            "seed": 4,
         }
         self.option_stack.setCurrentIndex(stage_indices.get(self._display_stage, 0))
 
@@ -1574,10 +2153,17 @@ class AutoDetectionPanel(QWidget):
             "clahe": self.display_clahe_button,
             "ridge": self.display_ridge_button,
             "clean": self.display_clean_button,
-            "seed": self.display_seed_button,
         }
         for stage, button in buttons.items():
             button.setChecked(stage == self._display_stage)
+
+    def _auto_process_common_steps(self) -> None:
+        if not self._image_path:
+            self._set_status_neutral("Load a BLN image in Project Files before running Common Steps.")
+            return
+        self._display_stage = "clean"
+        self._update_stage_buttons()
+        self._run_preprocessing()
 
     def _clahe_spin_changed(self) -> None:
         value = int(round(self.clahe_clip.value() * 1000.0))
@@ -1596,16 +2182,18 @@ class AutoDetectionPanel(QWidget):
         if not self._image_path:
             return
         if self._display_stage == "original":
-            self._run_region()
+            self._show_display_stage()
             return
         self._run_preprocessing()
 
     def _show_display_stage(self) -> None:
         if self._display_stage == "original":
-            if self._region is None:
-                self._run_region()
-            if self._region is not None:
-                self.display_preview.set_array(self._region["display_rgb"])
+            try:
+                preview_region = load_downsampled_processing_region(self._params())
+            except Exception:
+                self.display_preview.set_array(None)
+            else:
+                self.display_preview.set_array(preview_region["display_rgb"])
             return
         if self._preprocess_preview is None:
             self.display_preview.set_array(None)
@@ -1613,11 +2201,9 @@ class AutoDetectionPanel(QWidget):
         if self._display_stage == "clahe":
             self.display_preview.set_array(self._preprocess_preview["enhanced"])
         elif self._display_stage == "ridge":
-            self.display_preview.set_array(display_image(self._preprocess_preview["ridges"], mode="magma"))
+            self.display_preview.set_array(self._preprocess_preview["candidate_mask"])
         elif self._display_stage == "clean":
             self.display_preview.set_array(self._preprocess_preview["candidate_clean"])
-        elif self._display_stage == "seed":
-            self.display_preview.set_array(self._preprocess_preview["display_mask"])
 
     @staticmethod
     def _spin(minimum: int, maximum: int, step: int, value: int) -> QSpinBox:

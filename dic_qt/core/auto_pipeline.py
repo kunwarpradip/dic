@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 from PIL import Image
 from scipy import ndimage as ndi
 from scipy.spatial import cKDTree
@@ -18,22 +19,40 @@ from .algorithm import detect_line_from_seed
 from .models import DicLine, Point
 
 
+BOUNDARY_EVENT_COLUMNS = [
+    "event_id",
+    "original_event_id",
+    "cut_index",
+    "method",
+    "num_pixels",
+    "bbox_min_x",
+    "bbox_max_x",
+    "bbox_min_y",
+    "bbox_max_y",
+    "removed_boundary_pixels_from_original",
+    "segments_from_original",
+    "discarded_small_segments",
+]
+BOUNDARY_PIXEL_COLUMNS = ["event_id", "original_event_id", "cut_index", "pixel_x", "pixel_y"]
+
+
 @dataclass(frozen=True)
 class AutoPipelineParams:
     image_path: str
     display_min: float = 0.0
     display_max: float = 1.0
+    display_brightness: float = 0.0
     use_full_image: bool = False
     crop_x: int = 0
     crop_y: int = 0
     crop_width: int = 500
     crop_height: int = 500
-    clahe_clip_limit: float = 0.100
-    ridge_sigma_max: int = 4
-    ridge_percentile: float = 88.0
-    threshold_multiplier: float = 0.40
-    min_object_size: int = 231
-    closing_radius: int = 3
+    clahe_clip_limit: float = 0.300
+    ridge_sigma_max: int = 3
+    ridge_percentile: float = 80.0
+    threshold_multiplier: float = 0.80
+    min_object_size: int = 40
+    closing_radius: int = 1
     use_skeletonize: bool = True
     hough_threshold: int = 20
     hough_line_length: int = 30
@@ -48,7 +67,7 @@ class AutoPipelineParams:
     duplicate_overlap: float = 0.50
     merge_distance_tolerance: float = 5.0
     merge_angle_tolerance: float = 12.0
-    connect_merged_event_gaps: bool = True
+    connect_merged_event_gaps: bool = False
 
 
 def image_size(path_str: str) -> tuple[int, int]:
@@ -108,7 +127,7 @@ def load_region(params: AutoPipelineParams) -> dict:
     with Image.open(params.image_path) as img:
         arr = np.asarray(img.crop((x0, y0, x0 + width, y0 + height))).copy()
 
-    display_rgb = display_crop_rgb(arr, params.display_min, params.display_max)
+    display_rgb = display_crop_rgb(arr, params.display_min, params.display_max, params.display_brightness)
     return {
         "raw": arr,
         "raw_normalized_rgb": normalize_to_uint8_rgb(np.squeeze(arr)),
@@ -206,11 +225,202 @@ def run_hough_seed_detection(preprocess: dict, params: AutoPipelineParams) -> di
     }
 
 
-def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams) -> dict:
+def run_mask_event_detection(preprocess: dict, params: AutoPipelineParams) -> dict:
+    labels = measure.label(preprocess["candidate_clean"], connectivity=2)
+    props = measure.regionprops(labels)
+    accepted: list[DicLine] = []
+    for prop in props:
+        if prop.area < max(1, int(params.min_object_size)):
+            continue
+        rows, cols = prop.coords.T
+        points = {Point(x=int(col), y=int(row)) for row, col in zip(rows, cols)}
+        if not points:
+            continue
+        accepted.append(
+            DicLine(
+                is_manual=False,
+                points=points,
+                seed_point=None,
+                intensity_difference_tolerance=params.intensity_difference_tolerance,
+                bfl_tolerance=params.best_fit_line_tolerance,
+                min_intensity=params.min_intensity,
+            )
+        )
+    return {
+        "accepted": accepted,
+        "accepted_count": int(len(accepted)),
+        "component_count": int(labels.max()),
+        "overlay": draw_mask_event_overlay(preprocess["crop"]["display_rgb"], accepted),
+    }
+
+
+def run_boundary_cut_events(
+    preprocess: dict,
+    event_result: dict,
+    boundary_path: str,
+    black_threshold: float,
+    boundary_dilation_radius: int,
+    min_segment_pixels: int,
+    connectivity: int,
+) -> dict:
+    source_events = event_result.get("accepted", [])
+    crop_x, crop_y = preprocess["crop"]["origin"]
+    crop_h, crop_w = preprocess["crop"]["display_rgb"].shape[:2]
+    boundary_mask = load_black_boundary_mask(boundary_path, black_threshold)
+    if boundary_dilation_radius > 0:
+        cut_mask = morphology.binary_dilation(
+            boundary_mask,
+            morphology.disk(int(boundary_dilation_radius)),
+        )
+    else:
+        cut_mask = boundary_mask
+
+    if cut_mask.shape[0] < crop_y + crop_h or cut_mask.shape[1] < crop_x + crop_w:
+        raise ValueError(
+            "Boundary image is smaller than the selected DIC region. "
+            f"Boundary mask is {cut_mask.shape[1]} x {cut_mask.shape[0]}, "
+            f"selected DIC region ends at x={crop_x + crop_w}, y={crop_y + crop_h}."
+        )
+
+    boundary_crop = cut_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+    accepted: list[DicLine] = []
+    summaries: list[dict] = []
+    removed_points: set[Point] = set()
+    event_rows: list[dict] = []
+    pixel_rows: list[dict] = []
+    new_event_index = 0
+
+    for source_index, line in enumerate(source_events, start=1):
+        if not line.points:
+            continue
+        xs = np.array([point.x for point in line.points], dtype=int)
+        ys = np.array([point.y for point in line.points], dtype=int)
+        valid = (xs >= 0) & (xs < crop_w) & (ys >= 0) & (ys < crop_h)
+        xs = xs[valid]
+        ys = ys[valid]
+        if len(xs) == 0:
+            continue
+
+        pad = max(3, int(boundary_dilation_radius) + 3)
+        x0 = max(int(xs.min()) - pad, 0)
+        x1 = min(int(xs.max()) + pad + 1, crop_w)
+        y0 = max(int(ys.min()) - pad, 0)
+        y1 = min(int(ys.max()) + pad + 1, crop_h)
+
+        local_event = np.zeros((y1 - y0, x1 - x0), dtype=bool)
+        local_event[ys - y0, xs - x0] = True
+        local_cut_mask = boundary_crop[y0:y1, x0:x1]
+        boundary_hit_pixels = local_event & local_cut_mask
+        cut_event = local_event & ~local_cut_mask
+
+        hit_rows, hit_cols = np.where(boundary_hit_pixels)
+        removed_points.update(Point(x=int(x0 + col), y=int(y0 + row)) for row, col in zip(hit_rows, hit_cols))
+
+        labels = measure.label(cut_event, connectivity=int(connectivity))
+        props = measure.regionprops(labels)
+        kept_segments = [prop for prop in props if prop.area >= int(min_segment_pixels)]
+        discarded_small_segments = len(props) - len(kept_segments)
+
+        for cut_index, segment in enumerate(kept_segments, start=1):
+            rr, cc = segment.coords.T
+            points = {Point(x=int(x0 + col), y=int(y0 + row)) for row, col in zip(rr, cc)}
+            if not points:
+                continue
+            new_event_index += 1
+            event_id = f"event_{new_event_index:05d}"
+            original_event_id = f"source_{source_index:05d}"
+            point_xs = [point.x for point in points]
+            point_ys = [point.y for point in points]
+            accepted.append(
+                DicLine(
+                    is_manual=False,
+                    points=points,
+                    seed_point=line.seed_point,
+                    intensity_difference_tolerance=line.intensity_difference_tolerance,
+                    bfl_tolerance=line.bfl_tolerance,
+                    min_intensity=line.min_intensity,
+                )
+            )
+            event_rows.append(
+                {
+                    "event_id": event_id,
+                    "original_event_id": original_event_id,
+                    "cut_index": int(cut_index),
+                    "method": "boundary_cut",
+                    "num_pixels": int(len(points)),
+                    "bbox_min_x": int(crop_x + min(point_xs)),
+                    "bbox_max_x": int(crop_x + max(point_xs)),
+                    "bbox_min_y": int(crop_y + min(point_ys)),
+                    "bbox_max_y": int(crop_y + max(point_ys)),
+                    "removed_boundary_pixels_from_original": int(boundary_hit_pixels.sum()),
+                    "segments_from_original": int(len(kept_segments)),
+                    "discarded_small_segments": int(discarded_small_segments),
+                }
+            )
+            for point in sorted(points):
+                pixel_rows.append(
+                    {
+                        "event_id": event_id,
+                        "original_event_id": original_event_id,
+                        "cut_index": int(cut_index),
+                        "pixel_x": int(crop_x + point.x),
+                        "pixel_y": int(crop_y + point.y),
+                    }
+                )
+
+        summaries.append(
+            {
+                "source_index": source_index,
+                "source_pixels": int(len(xs)),
+                "removed_boundary_pixels": int(boundary_hit_pixels.sum()),
+                "kept_segments": int(len(kept_segments)),
+                "discarded_small_segments": int(discarded_small_segments),
+            }
+        )
+
+    overlay = draw_boundary_cut_overlay(
+        preprocess["crop"]["display_rgb"],
+        accepted,
+        boundary_crop,
+        removed_points,
+    )
+    return {
+        "accepted": accepted,
+        "accepted_count": int(len(accepted)),
+        "source_count": int(len(source_events)),
+        "source_pixel_count": int(sum(line.size for line in source_events)),
+        "kept_pixel_count": int(sum(line.size for line in accepted)),
+        "removed_pixel_count": int(len(removed_points)),
+        "events_touching_boundary": int(sum(1 for item in summaries if item["removed_boundary_pixels"] > 0)),
+        "events_split": int(sum(1 for item in summaries if item["kept_segments"] > 1)),
+        "discarded_small_segments": int(sum(item["discarded_small_segments"] for item in summaries)),
+        "boundary_pixel_count": int(boundary_crop.sum()),
+        "overlay": overlay,
+        "summary": summaries,
+        "events": pd.DataFrame(event_rows, columns=BOUNDARY_EVENT_COLUMNS),
+        "event_pixels": pd.DataFrame(pixel_rows, columns=BOUNDARY_PIXEL_COLUMNS),
+    }
+
+
+def load_black_boundary_mask(boundary_path: str, black_threshold: float) -> np.ndarray:
+    with Image.open(boundary_path) as img:
+        arr = np.asarray(img).copy()
+    if arr.ndim == 3:
+        gray = arr[..., :3].astype(np.float32).mean(axis=2) / 255.0
+    else:
+        gray = arr.astype(np.float32)
+        if gray.max() > 1:
+            gray = gray / 255.0
+    return gray < float(black_threshold)
+
+
+def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams, progress_callback=None) -> dict:
     accepted_entries: list[dict] = []
     rejected = 0
 
-    for seed in hough["seeds"]:
+    seeds = hough["seeds"]
+    total_seeds = len(seeds)
+    for seed_index, seed in enumerate(seeds, start=1):
         result = detect_line_from_seed(
             seed.x,
             seed.y,
@@ -243,6 +453,8 @@ def trace_hough_events(preprocess: dict, hough: dict, params: AutoPipelineParams
             accepted_entries.append({"line": merged_line, "seeds": merged_seeds, "was_merged": True})
         else:
             accepted_entries.append({"line": result.line, "seeds": {seed}, "was_merged": False})
+        if progress_callback is not None:
+            progress_callback(seed_index, total_seeds)
 
     accepted = [entry["line"] for entry in accepted_entries]
     standalone_seeds = [
@@ -502,6 +714,41 @@ def draw_event_overlay(
     return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
 
 
+def draw_mask_event_overlay(rgb: np.ndarray, lines: list[DicLine]) -> np.ndarray:
+    out = rgb.astype(np.float32) / 255.0
+    mask = np.zeros(out.shape[:2], dtype=bool)
+    for line in lines:
+        for point in line.points:
+            if 0 <= point.x < mask.shape[1] and 0 <= point.y < mask.shape[0]:
+                mask[point.y, point.x] = True
+    out[mask] = [1.0, 0.0, 0.0]
+    return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def draw_boundary_cut_overlay(
+    rgb: np.ndarray,
+    cut_lines: list[DicLine],
+    boundary_crop: np.ndarray,
+    removed_points: set[Point],
+) -> np.ndarray:
+    out = rgb.astype(np.float32) / 255.0
+    kept_mask = np.zeros(out.shape[:2], dtype=bool)
+    removed_mask = np.zeros(out.shape[:2], dtype=bool)
+    for line in cut_lines:
+        for point in line.points:
+            if 0 <= point.x < kept_mask.shape[1] and 0 <= point.y < kept_mask.shape[0]:
+                kept_mask[point.y, point.x] = True
+    for point in removed_points:
+        if 0 <= point.x < removed_mask.shape[1] and 0 <= point.y < removed_mask.shape[0]:
+            removed_mask[point.y, point.x] = True
+    boundary_display = boundary_crop.astype(bool, copy=False)
+    if boundary_display.shape == kept_mask.shape:
+        out[boundary_display] = [0.0, 0.31, 1.0]
+    out[kept_mask] = [1.0, 0.0, 0.0]
+    out[removed_mask] = [0.0, 0.86, 0.31]
+    return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+
+
 def draw_points(
     image: np.ndarray,
     seeds: list[Point],
@@ -535,24 +782,32 @@ def detection_rgb_to_unit_gray(detection_rgb: np.ndarray) -> np.ndarray:
     return np.clip(gray / 255.0, 0.0, 1.0)
 
 
-def display_crop_rgb(arr: np.ndarray, display_min: float, display_max: float) -> np.ndarray:
+def display_crop_rgb(arr: np.ndarray, display_min: float, display_max: float, brightness_adjust: float = 0.0) -> np.ndarray:
     squeezed = np.squeeze(arr)
     if squeezed.ndim == 3 and squeezed.shape[2] >= 3:
-        return to_uint8_rgb(squeezed)
-    return scale_to_uint8_rgb(squeezed, display_min, display_max)
+        return apply_output_brightness(to_uint8_rgb(squeezed), brightness_adjust)
+    return scale_to_uint8_rgb(squeezed, display_min, display_max, brightness_adjust)
 
 
-def scale_to_uint8_rgb(arr: np.ndarray, display_min: float, display_max: float) -> np.ndarray:
+def scale_to_uint8_rgb(arr: np.ndarray, display_min: float, display_max: float, brightness_adjust: float = 0.0) -> np.ndarray:
     values = np.nan_to_num(arr.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
     if display_max <= display_min:
         scaled = np.zeros(values.shape, dtype=np.uint8)
     else:
         scaled = (np.clip((values - display_min) / (display_max - display_min), 0.0, 1.0) * 255).astype(np.uint8)
+    scaled = apply_output_brightness(scaled, brightness_adjust)
     if scaled.ndim == 2:
         return gray_to_rgb(scaled)
     if scaled.ndim == 3 and scaled.shape[2] >= 3:
         return scaled[..., :3]
     return gray_to_rgb(np.squeeze(scaled))
+
+
+def apply_output_brightness(values: np.ndarray, brightness_adjust: float = 0.0) -> np.ndarray:
+    if abs(float(brightness_adjust)) < 1e-9:
+        return values
+    shifted = values.astype(np.float32, copy=False) + float(brightness_adjust) / 100.0 * 127.5
+    return np.clip(shifted, 0.0, 255.0).astype(np.uint8)
 
 
 def normalize_to_uint8_rgb(arr: np.ndarray) -> np.ndarray:
