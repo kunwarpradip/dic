@@ -149,6 +149,13 @@ class ProjectFilesPanel(QWidget):
             for slot in FILE_SLOTS
         }
 
+    def set_selected_files(self, paths: dict[str, str], refresh: bool = True) -> None:
+        for slot in FILE_SLOTS:
+            if slot.key in paths:
+                self.path_edits[slot.key].setText(str(paths.get(slot.key, "") or ""))
+        if refresh:
+            self.refresh_summary()
+
     def load_analysis_defaults(self, refresh: bool = True) -> None:
         if not ANALYSIS_DEFAULTS_PATH.exists():
             self.overall_label.setText(f"No saved analysis defaults found at {ANALYSIS_DEFAULTS_PATH}.")

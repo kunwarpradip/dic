@@ -7,6 +7,7 @@ Written by Duncan Greeley (dgreeley@lanl.gov) and others.
 # ---- Import packages ----
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import sys
 from pathlib import Path
 
 # =============================================================================
@@ -17,11 +18,33 @@ from pathlib import Path
 HCP_MILLER_INDEX_DIR = Path(__file__).with_name("hcp_slip_twin_miller_indices")
 
 
+def hcp_miller_index_search_dirs():
+    dirs = [
+        Path(HCP_MILLER_INDEX_DIR),
+        Path(__file__).resolve().with_name("hcp_slip_twin_miller_indices"),
+        Path.cwd() / "hcp_slip_twin_miller_indices",
+    ]
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        dirs.insert(0, Path(bundle_root) / "hcp_slip_twin_miller_indices")
+    seen = set()
+    unique_dirs = []
+    for directory in dirs:
+        resolved = str(directory.expanduser())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_dirs.append(directory.expanduser())
+    return unique_dirs
+
+
 def load_hcp_miller_indices(filename):
-    path = HCP_MILLER_INDEX_DIR / filename
-    if not path.exists():
+    checked_paths = [directory / filename for directory in hcp_miller_index_search_dirs()]
+    path = next((candidate for candidate in checked_paths if candidate.exists()), None)
+    if path is None:
+        checked = "\n".join(str(candidate) for candidate in checked_paths)
         raise FileNotFoundError(
-            f"Required HCP Miller-index table is missing: {path}"
+            "Required HCP Miller-index table is missing. Checked:\n"
+            f"{checked}"
         )
     return np.loadtxt(path, delimiter=",")
 

@@ -4,6 +4,7 @@ from typing import Callable
 
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -36,6 +37,7 @@ class ClassificationPanel(QWidget):
         self._alignment_context_provider = alignment_context_provider
         self._reviewed_events_provider = reviewed_events_provider
         self._score_result = None
+        self._reviewed_result = None
 
         layout = QVBoxLayout(self)
         title = QLabel("Classification")
@@ -76,6 +78,13 @@ class ClassificationPanel(QWidget):
         run_button.setToolTip("Score the current Manual Review events against the selected crystal slip/twin trace vectors.")
         run_button.clicked.connect(self.classify_events)
         actions.addWidget(run_button)
+        self.save_button = QPushButton("Save Classified CSVs")
+        self.save_button.setEnabled(False)
+        self.save_button.setToolTip(
+            "Save event-level classification details and pixel-level masks with classification metadata."
+        )
+        self.save_button.clicked.connect(self.save_classified_csvs)
+        actions.addWidget(self.save_button)
         actions.addStretch(1)
         layout.addLayout(actions)
 
@@ -111,8 +120,10 @@ class ClassificationPanel(QWidget):
                 morphology=None,
                 included_shape_types=None,
             )
+            self._reviewed_result = reviewed
         except Exception as exc:
             self._set_error(f"Classification failed: {exc}")
+            self.save_button.setEnabled(False)
             return
 
         counts = self._score_result["classification"].value_counts().to_dict()
@@ -128,10 +139,105 @@ class ClassificationPanel(QWidget):
             f"matched {counts.get('likely_real', 0):,} | noise {counts.get('likely_noise', 0):,} | "
             f"matched slips {kinds.get('slip', 0):,} | matched twins {kinds.get('twin', 0):,}"
         )
+        self.save_button.setEnabled(True)
         self._fill_table(
             self._score_result.head(300),
             ["event_id", "classification", "score", "best_mode", "best_trace_kind", "best_angle_error_deg", "event_center_x", "event_center_y", "linearity"],
         )
+
+    def save_classified_csvs(self) -> None:
+        if self._score_result is None or self._reviewed_result is None:
+            self._set_error("Run classification before saving classified CSVs.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save classified event pixels CSV",
+            "classified_event_pixels.csv",
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            pixels_path = self._normalized_csv_path(path)
+            prefix = pixels_path.name
+            if prefix.endswith("_event_pixels.csv"):
+                stem = prefix[: -len("_event_pixels.csv")]
+            elif prefix.endswith(".csv"):
+                stem = prefix[:-4]
+            else:
+                stem = prefix
+            events_path = pixels_path.with_name(f"{stem}_events.csv")
+
+            events, event_pixels = self._classified_export_frames()
+            events.to_csv(events_path, index=False)
+            event_pixels.to_csv(pixels_path, index=False)
+        except Exception as exc:
+            self._set_error(f"Saving classified CSVs failed: {exc}")
+            return
+
+        self._set_neutral(
+            "Saved classified CSVs:\n"
+            f"Events: {events_path}\n"
+            f"Event pixels: {pixels_path}"
+        )
+
+    def _classified_export_frames(self):
+        reviewed_events = self._reviewed_result["events"].copy()
+        reviewed_pixels = self._reviewed_result["event_pixels"].copy()
+        scores = self._score_result.copy()
+        reviewed_events["event_id"] = reviewed_events["event_id"].astype(str)
+        reviewed_pixels["event_id"] = reviewed_pixels["event_id"].astype(str)
+        scores["event_id"] = scores["event_id"].astype(str)
+
+        event_columns_to_drop = [
+            column
+            for column in ["event_type", "num_pixels", "bbox_min_x", "bbox_max_x", "bbox_min_y", "bbox_max_y"]
+            if column in scores.columns and column in reviewed_events.columns
+        ]
+        event_scores = scores.drop(columns=event_columns_to_drop, errors="ignore")
+        events = reviewed_events.merge(event_scores, on="event_id", how="left")
+
+        pixel_metadata_columns = [
+            "event_id",
+            "classification",
+            "score",
+            "best_mode",
+            "best_trace_mode",
+            "best_trace_kind",
+            "best_angle_error_deg",
+            "angle_tolerance_deg",
+            "event_center_x",
+            "event_center_y",
+            "event_angle_deg",
+            "event_vector",
+            "best_trace_vector",
+            "best_trace_angle_deg",
+            "nearest_ang_x_dic",
+            "nearest_ang_y_dic",
+            "nearest_ang_x_ebsd",
+            "nearest_ang_y_ebsd",
+            "nearest_phi1",
+            "nearest_Phi",
+            "nearest_phi2",
+            "center_lookup_distance",
+            "linearity",
+            "event_length_pixels",
+            "passes_angle",
+            "passes_lookup",
+            "passes_linearity",
+        ]
+        available_pixel_metadata = [column for column in pixel_metadata_columns if column in scores.columns]
+        pixels = reviewed_pixels.merge(scores[available_pixel_metadata], on="event_id", how="left")
+        return events, pixels
+
+    @staticmethod
+    def _normalized_csv_path(path: str):
+        from pathlib import Path
+
+        out_path = Path(path).expanduser()
+        if out_path.suffix.lower() != ".csv":
+            out_path = out_path.with_suffix(".csv")
+        return out_path
 
     def _fill_table(self, frame, columns: list[str]) -> None:
         self.table.setRowCount(len(frame))

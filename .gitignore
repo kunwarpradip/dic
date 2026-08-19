@@ -20,3 +20,4 @@ check_traces.py
 build
 dist
 DIC_Event_App.spec
+*.dicreview*

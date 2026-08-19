@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 import copy
@@ -45,11 +47,15 @@ class MainWindow(QMainWindow):
         self.image_rgb: np.ndarray | None = None
         self.detection_rgb: np.ndarray | None = None
         self.repository: DicLineRepository | None = None
-        self._undo_stack: list[tuple[list[DicLine], set[UUID]]] = []
-        self._redo_stack: list[tuple[list[DicLine], set[UUID]]] = []
+        self._undo_stack: list[Any] = []
+        self._redo_stack: list[Any] = []
         self._max_history = 40
         self._manual_boundary_mask: np.ndarray | None = None
         self._manual_boundary_path: str | None = None
+        self._manual_brush_edit_active = False
+        self._manual_brush_changed = False
+        self._manual_brush_original_line: DicLine | None = None
+        self._manual_brush_visible_before: set[UUID] | None = None
 
         self.canvas = ImageCanvas()
         self.line_list = LineListPanel()
@@ -114,7 +120,8 @@ class MainWindow(QMainWindow):
             self.load_shape_events_for_manual_review
         )
 
-        self.settings.choose_file_button.clicked.connect(self.choose_file)
+        self.settings.save_progress_button.clicked.connect(self.save_manual_review_progress)
+        self.settings.load_progress_button.clicked.connect(self.load_manual_review_progress)
         self.line_list.cut_mode_changed.connect(self.canvas.set_cut_mode)
         self.line_list.edit_mode_changed.connect(self.canvas.set_edit_mode)
         self.line_list.brush_radius_changed.connect(self.canvas.set_brush_radius)
@@ -145,11 +152,16 @@ class MainWindow(QMainWindow):
         self.canvas.image_mouse_moved.connect(self.update_preview)
         self.canvas.line_toggled.connect(self.select_line_from_canvas)
         self.canvas.cut_completed.connect(self.cut_lines)
+        self.canvas.area_erase_completed.connect(self.erase_pixels_in_drawn_area)
+        self.canvas.pixel_edit_started.connect(self.begin_manual_brush_edit)
         self.canvas.pixel_edit_requested.connect(self.edit_selected_event_pixels)
+        self.canvas.pixel_edit_finished.connect(self.finish_manual_brush_edit)
         self.canvas.zoom_changed.connect(self.zoom_changed)
         self.line_list.visibility_changed.connect(self.set_line_visibility)
+        self.line_list.visibility_many_changed.connect(self.set_many_line_visibility)
         self.line_list.selection_changed_for_actions.connect(self.update_event_selection_status)
         self.line_list.select_all_requested.connect(self.select_all_events)
+        self.line_list.locate_requested.connect(self.locate_selected_event)
         self.line_list.merge_requested.connect(self.merge_selected_lines)
         self.line_list.delete_requested.connect(self.delete_selected_lines)
         self.canvas.set_create_mode(False)
@@ -261,7 +273,7 @@ class MainWindow(QMainWindow):
             image_width=w,
             image_height=h,
             lines=lines,
-            visible_line_ids={line.id for line in lines},
+            visible_line_ids=set(),
         )
         self._manual_boundary_mask = None
         self._manual_boundary_path = None
@@ -278,7 +290,7 @@ class MainWindow(QMainWindow):
         loaded_type_text = ", ".join(event_type.replace("_", " ") for event_type in loaded_types) or "none"
         self.status_label.setText(
             f"Manual Review populated with {len(lines)} auto events: {loaded_type_text}. "
-            "Select one event, then use Add pixels or Erase pixels for brush edits."
+            "Events are hidden by default for speed; check events or press Select All to show overlays."
         )
 
     def reviewed_event_tables(self) -> dict:
@@ -308,6 +320,268 @@ class MainWindow(QMainWindow):
             "event_pixels": pd.DataFrame(pixel_rows),
         }
 
+    def save_manual_review_progress(self) -> None:
+        if not self._image_is_loaded() or not self.session.lines:
+            self.status_label.setText("No Manual Review progress to save.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Manual Review Progress",
+            "manual_review_progress.dicreview.json",
+            "DIC review checkpoint (*.dicreview.json);;JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        checkpoint_path = self._normalized_checkpoint_path(path)
+        try:
+            events, event_pixels = self._manual_review_checkpoint_tables()
+            events_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_events.csv")
+            pixels_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_event_pixels.csv")
+            events.to_csv(events_path, index=False)
+            event_pixels.to_csv(pixels_path, index=False)
+            payload = {
+                "version": 1,
+                "kind": "dic_qt_manual_review_checkpoint",
+                "project_files": self.project_files_panel.selected_files(),
+                "session": {
+                    "image_path": self.session.image_path,
+                    "image_width": int(self.session.image_width),
+                    "image_height": int(self.session.image_height),
+                    "visible_event_ids": [str(line_id) for line_id in sorted(self.session.visible_line_ids, key=str)],
+                },
+                "manual_settings": {
+                    "intensity_difference_tolerance": int(self.settings.intensity_tolerance.value()),
+                    "best_fit_line_tolerance": float(self.settings.bfl_tolerance.value()),
+                    "minimum_intensity": int(self.settings.min_intensity.value()),
+                    "brush_radius": int(self.line_list.brush_radius.value()),
+                    "boundary_overlay_visible": bool(self.line_list.boundary_overlay_checkbox.isChecked()),
+                },
+                "files": {
+                    "events_csv": events_path.name,
+                    "event_pixels_csv": pixels_path.name,
+                },
+                "counts": {
+                    "events": int(len(events)),
+                    "pixels": int(len(event_pixels)),
+                },
+            }
+            checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:
+            self.status_label.setText(f"Could not save Manual Review progress: {exc}")
+            return
+        self.status_label.setText(
+            "Saved Manual Review progress:\n"
+            f"{checkpoint_path}\n"
+            f"{events_path}\n"
+            f"{pixels_path}"
+        )
+
+    def load_manual_review_progress(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Manual Review Progress",
+            str(Path.cwd()),
+            "DIC review checkpoint (*.dicreview.json *.json);;All files (*)",
+        )
+        if not path:
+            return
+        checkpoint_path = Path(path).expanduser()
+        try:
+            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if payload.get("kind") != "dic_qt_manual_review_checkpoint":
+                raise ValueError("This is not a DIC manual review checkpoint.")
+            project_files = payload.get("project_files", {})
+            if not isinstance(project_files, dict):
+                raise ValueError("Checkpoint is missing project file paths.")
+            files = payload.get("files", {})
+            events_path = self._checkpoint_sidecar_path(checkpoint_path, files.get("events_csv"))
+            pixels_path = self._checkpoint_sidecar_path(checkpoint_path, files.get("event_pixels_csv"))
+            events = pd.read_csv(events_path)
+            event_pixels = pd.read_csv(pixels_path)
+            if not {"event_id", "pixel_x", "pixel_y"}.issubset(event_pixels.columns):
+                raise ValueError("Checkpoint event pixels CSV must include event_id, pixel_x, and pixel_y.")
+
+            self.project_files_panel.set_selected_files(project_files, refresh=True)
+            bln_path = str(project_files.get("bln_image") or payload.get("session", {}).get("image_path") or "").strip()
+            if not bln_path:
+                raise ValueError("Checkpoint does not contain a BLN image path.")
+            loaded = load_image_data(Path(bln_path).expanduser())
+            lines = self._lines_from_checkpoint_tables(events, event_pixels)
+            h, w, _ = loaded.display_rgb.shape
+            session_payload = payload.get("session", {})
+            saved_visible_values = session_payload.get("visible_event_ids", [])
+            visible_ids = {
+                UUID(str(line_id))
+                for line_id in saved_visible_values
+                if self._looks_like_uuid(str(line_id))
+            }
+            existing_ids = {line.id for line in lines}
+            visible_ids.intersection_update(existing_ids)
+            if "visible_event_ids" not in session_payload:
+                visible_ids = set(existing_ids)
+
+            self.raw_image = loaded.raw
+            self.image_rgb = loaded.display_rgb
+            self.detection_rgb = loaded.detection_rgb
+            self.repository = None
+            self.session = DicSession(
+                image_path=str(Path(bln_path).expanduser()),
+                db_path=None,
+                image_width=w,
+                image_height=h,
+                lines=lines,
+                visible_line_ids=visible_ids,
+            )
+            settings = payload.get("manual_settings", {})
+            self.settings.intensity_tolerance.setValue(int(settings.get("intensity_difference_tolerance", self.settings.intensity_tolerance.value())))
+            self.settings.bfl_tolerance.setValue(float(settings.get("best_fit_line_tolerance", self.settings.bfl_tolerance.value())))
+            self.settings.min_intensity.setValue(int(settings.get("minimum_intensity", self.settings.min_intensity.value())))
+            self.line_list.brush_radius.setValue(int(settings.get("brush_radius", self.line_list.brush_radius.value())))
+            self.canvas.set_image(self.image_rgb)
+            self._manual_boundary_mask = None
+            self._manual_boundary_path = None
+            self.line_list.boundary_overlay_checkbox.blockSignals(True)
+            self.line_list.boundary_overlay_checkbox.setChecked(bool(settings.get("boundary_overlay_visible", False)))
+            self.line_list.boundary_overlay_checkbox.blockSignals(False)
+            self.canvas.set_boundary_mask(None)
+            self.canvas.set_boundary_visible(False)
+            self._clear_history()
+            self.refresh_lines()
+            if self.line_list.boundary_overlay_checkbox.isChecked():
+                self.set_manual_boundary_overlay(True)
+            self.tabs.setCurrentIndex(2)
+        except Exception as exc:
+            self.status_label.setText(f"Could not load Manual Review progress: {exc}")
+            return
+        self.status_label.setText(
+            f"Resumed Manual Review from {checkpoint_path.name}: "
+            f"{len(self.session.lines):,} events, {sum(line.size for line in self.session.lines):,} pixels."
+        )
+
+    def _manual_review_checkpoint_tables(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        event_rows = []
+        pixel_rows = []
+        for line in self.session.lines:
+            if not isinstance(line, DicLine) or not line.points:
+                continue
+            event_id = str(line.id)
+            xs = [point.x for point in line.points]
+            ys = [point.y for point in line.points]
+            seed = line.seed_point
+            event_rows.append(
+                {
+                    "event_id": event_id,
+                    "event_type": getattr(line, "event_type", "manual" if line.is_manual else "reviewed"),
+                    "source_event_id": getattr(line, "source_event_id", event_id),
+                    "is_manual": bool(line.is_manual),
+                    "num_pixels": int(len(line.points)),
+                    "bbox_min_x": int(min(xs)),
+                    "bbox_max_x": int(max(xs)),
+                    "bbox_min_y": int(min(ys)),
+                    "bbox_max_y": int(max(ys)),
+                    "seed_point_x": int(seed.x) if seed is not None else "",
+                    "seed_point_y": int(seed.y) if seed is not None else "",
+                    "intensity_difference_tolerance": int(line.intensity_difference_tolerance),
+                    "best_fit_line_tolerance": float(line.bfl_tolerance),
+                    "minimum_intensity": int(line.min_intensity),
+                }
+            )
+            for point in sorted(line.points):
+                pixel_rows.append({"event_id": event_id, "pixel_x": int(point.x), "pixel_y": int(point.y)})
+        return pd.DataFrame(event_rows), pd.DataFrame(pixel_rows)
+
+    def _lines_from_checkpoint_tables(self, events: pd.DataFrame, event_pixels: pd.DataFrame) -> list[DicLine]:
+        events = events.copy()
+        event_pixels = event_pixels.copy()
+        events["event_id"] = events["event_id"].astype(str)
+        event_pixels["event_id"] = event_pixels["event_id"].astype(str)
+        event_pixels["pixel_x"] = event_pixels["pixel_x"].astype(np.int64)
+        event_pixels["pixel_y"] = event_pixels["pixel_y"].astype(np.int64)
+        event_lookup = events.set_index("event_id", drop=False) if "event_id" in events.columns else pd.DataFrame()
+        lines: list[DicLine] = []
+        for event_id, group in event_pixels.groupby("event_id", sort=False):
+            points = {
+                Point(int(x), int(y))
+                for x, y in group[["pixel_x", "pixel_y"]].itertuples(index=False)
+            }
+            if not points:
+                continue
+            row = event_lookup.loc[str(event_id)] if str(event_id) in event_lookup.index else None
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[0]
+            seed = None
+            if row is not None and "seed_point_x" in row and "seed_point_y" in row:
+                seed_x = pd.to_numeric(pd.Series([row["seed_point_x"]]), errors="coerce").iloc[0]
+                seed_y = pd.to_numeric(pd.Series([row["seed_point_y"]]), errors="coerce").iloc[0]
+                if pd.notna(seed_x) and pd.notna(seed_y):
+                    seed = Point(int(seed_x), int(seed_y))
+            line = DicLine(
+                id=UUID(str(event_id)) if self._looks_like_uuid(str(event_id)) else uuid5(NAMESPACE_URL, f"dic-review-checkpoint:{event_id}"),
+                is_manual=self._row_bool(row, "is_manual", False),
+                points=points,
+                seed_point=seed,
+                intensity_difference_tolerance=self._row_int(row, "intensity_difference_tolerance", 75),
+                bfl_tolerance=self._row_float(row, "best_fit_line_tolerance", 7.0),
+                min_intensity=self._row_int(row, "minimum_intensity", 120),
+            )
+            line.event_type = self._row_str(row, "event_type", "manual" if line.is_manual else "reviewed")
+            line.source_event_id = self._row_str(row, "source_event_id", str(event_id))
+            lines.append(line)
+        return lines
+
+    @staticmethod
+    def _normalized_checkpoint_path(path: str) -> Path:
+        out_path = Path(path).expanduser()
+        if out_path.suffix.lower() != ".json":
+            out_path = out_path.with_suffix(".dicreview.json")
+        return out_path
+
+    @staticmethod
+    def _checkpoint_sidecar_path(checkpoint_path: Path, value: object) -> Path:
+        if not value:
+            raise ValueError("Checkpoint is missing a sidecar CSV path.")
+        sidecar = Path(str(value)).expanduser()
+        if not sidecar.is_absolute():
+            sidecar = checkpoint_path.parent / sidecar
+        if not sidecar.exists():
+            raise ValueError(f"Checkpoint sidecar file is missing: {sidecar}")
+        return sidecar
+
+    @staticmethod
+    def _looks_like_uuid(value: str) -> bool:
+        try:
+            UUID(value)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _row_str(row, column: str, default: str) -> str:
+        if row is None or column not in row or pd.isna(row[column]):
+            return default
+        return str(row[column])
+
+    @staticmethod
+    def _row_bool(row, column: str, default: bool) -> bool:
+        if row is None or column not in row or pd.isna(row[column]):
+            return default
+        value = row[column]
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y"}
+        return bool(value)
+
+    @staticmethod
+    def _row_int(row, column: str, default: int) -> int:
+        if row is None or column not in row or pd.isna(row[column]):
+            return default
+        return int(float(row[column]))
+
+    @staticmethod
+    def _row_float(row, column: str, default: float) -> float:
+        if row is None or column not in row or pd.isna(row[column]):
+            return default
+        return float(row[column])
+
     def create_event_from_seed(self, x: int, y: int) -> None:
         if self.detection_rgb is None:
             self.status_label.setText("No detection image is loaded for seed growing.")
@@ -335,8 +609,9 @@ class MainWindow(QMainWindow):
             return
         line.is_manual = True
         line.event_type = "manual"
-        self._push_undo_state()
+        visible_before = set(self.session.visible_line_ids)
         self.session.add_line(line)
+        self._push_lines_undo_state([], [line], visible_before, set(self.session.visible_line_ids))
         if self.repository is not None:
             self.repository.save_new_lines([line])
         self.refresh_lines()
@@ -370,6 +645,14 @@ class MainWindow(QMainWindow):
             self.session.visible_line_ids.discard(line_id)
         self.canvas.set_lines(self.session.lines, self.session.visible_line_ids)
 
+    def set_many_line_visibility(self, line_ids: object, visible: bool) -> None:
+        ids = set(line_ids)
+        if visible:
+            self.session.visible_line_ids.update(ids)
+        else:
+            self.session.visible_line_ids.difference_update(ids)
+        self.canvas.set_lines(self.session.lines, self.session.visible_line_ids)
+
     def toggle_line_visibility(self, line_id: UUID) -> None:
         self.line_list.toggle_line(line_id)
 
@@ -384,29 +667,46 @@ class MainWindow(QMainWindow):
     def merge_selected_lines(self, selected_ids: set[UUID]) -> None:
         if not selected_ids:
             return
-        self._push_undo_state()
+        visible_before = set(self.session.visible_line_ids)
+        before_lines = [
+            copy.deepcopy(line)
+            for line in self.session.lines
+            if line.id in selected_ids
+        ]
         new_lines, merged = merge_lines(self.session.lines, selected_ids)
         if merged is None:
-            self._pop_empty_undo_state()
             return
         self.session.set_lines(new_lines)
         self.session.visible_line_ids.add(merged.id)
+        self._push_lines_undo_state(before_lines, [merged], visible_before, set(self.session.visible_line_ids))
         if self.repository is not None:
             self.repository.replace_all(self.session.lines)
         self.refresh_lines()
         self.status_label.setText(f"Merged {len(selected_ids)} lines into {merged.id}")
 
     def delete_selected_lines(self, selected_ids: set[UUID]) -> None:
+        selected_ids = set(selected_ids)
         if not selected_ids:
-            if not selected_ids:
-                self.status_label.setText("No selected events to delete")
+            self.status_label.setText("No selected events to delete")
             return
-        self._push_undo_state()
+        before_lines = [
+            copy.deepcopy(line)
+            for line in self.session.lines
+            if line.id in selected_ids
+        ]
+        if not before_lines:
+            self.status_label.setText("Selected events are no longer available.")
+            return
+        visible_before = set(self.session.visible_line_ids)
         self.session.delete_lines(selected_ids)
+        self._push_lines_undo_state(before_lines, [], visible_before, set(self.session.visible_line_ids))
         if self.repository is not None:
             self.repository.delete_lines(selected_ids)
-        self.refresh_lines()
-        self.status_label.setText(f"Deleted {len(selected_ids)} events")
+        self.line_list.remove_lines(selected_ids, self.session.visible_line_ids)
+        self.canvas.remove_lines(selected_ids, self.session.visible_line_ids)
+        self._apply_manual_tool_mode()
+        self._update_history_buttons()
+        self.status_label.setText(f"Deleted {len(before_lines)} events")
 
     def select_all_events(self) -> None:
         if not self._image_is_loaded():
@@ -429,10 +729,31 @@ class MainWindow(QMainWindow):
             f"Selected {len(selected_ids)} event(s). Check boxes control which events appear in the overlay."
         )
 
+    def locate_selected_event(self) -> None:
+        if not self._image_is_loaded():
+            return
+        selected_ids = self.line_list.selected_line_ids()
+        if not selected_ids:
+            selected_ids = self.line_list.checked_line_ids()
+        if not selected_ids:
+            self.status_label.setText("Select one event before using Locate Selected.")
+            return
+        if len(selected_ids) != 1:
+            self.status_label.setText("Locate Selected works with one event at a time.")
+            return
+        line = self.session.line_by_id(next(iter(selected_ids)))
+        if line is None:
+            self.status_label.setText("Selected event is no longer available.")
+            return
+        self.canvas.locate_line(line, center=True)
+        self.status_label.setText(f"Locating event {line.id} with {line.size:,} pixels.")
+
     def delete_selected_events(self) -> None:
         if not self._image_is_loaded():
             return
-        self.delete_selected_lines(self.line_list.checked_line_ids())
+        self.delete_selected_lines(
+            self.line_list.selected_line_ids() or self.line_list.checked_line_ids()
+        )
 
     def cut_lines(self, start: Point, end: Point) -> None:
         if not self._image_is_loaded():
@@ -444,6 +765,12 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Select or show at least one event before drawing a cut line.")
             return
         cut_width = max(3, int(self.line_list.brush_radius.value() * 2 + 1))
+        visible_before = set(self.session.visible_line_ids)
+        original_lines_by_id = {
+            line.id: copy.deepcopy(line)
+            for line in self.session.lines
+            if line.id in selected_ids
+        }
         new_lines, daughters = cut_selected_lines(
             self.session.lines,
             selected_ids,
@@ -457,13 +784,84 @@ class MainWindow(QMainWindow):
                 f"brush cut width was {cut_width} px."
             )
             return
-        self._push_undo_state()
+        new_line_ids = {line.id for line in new_lines}
+        affected_ids = set(original_lines_by_id) - new_line_ids
+        before_lines = [original_lines_by_id[line_id] for line_id in affected_ids]
+        after_lines = [copy.deepcopy(line) for line in daughters]
         self.session.set_lines(new_lines)
         self.session.visible_line_ids.update(line.id for line in daughters)
+        self._push_lines_undo_state(
+            before_lines,
+            after_lines,
+            visible_before,
+            set(self.session.visible_line_ids),
+        )
         if self.repository is not None:
             self.repository.replace_all(self.session.lines)
         self.refresh_lines()
         self.status_label.setText(f"Cut line into {len(daughters)} daughter lines")
+
+    def erase_pixels_in_drawn_area(self, polygon: object) -> None:
+        if not self._image_is_loaded():
+            return
+        polygon_points = [point for point in polygon if isinstance(point, Point)]
+        if len(polygon_points) < 3:
+            self.status_label.setText("Draw a larger closed area before erasing pixels.")
+            return
+        x_values = [point.x for point in polygon_points]
+        y_values = [point.y for point in polygon_points]
+        x0, x1 = min(x_values), max(x_values)
+        y0, y1 = min(y_values), max(y_values)
+        target_ids = self.line_list.selected_line_ids() or self.line_list.checked_line_ids()
+        if not target_ids:
+            target_ids = set(self.session.visible_line_ids)
+        if not target_ids:
+            self.status_label.setText("Select or show at least one event before using Erase area.")
+            return
+
+        before_lines: list[DicLine] = []
+        after_lines: list[DicLine] = []
+        new_lines: list[DicLine] = []
+        visible_before = set(self.session.visible_line_ids)
+        removed_pixels = 0
+        changed_count = 0
+        removed_ids: set[UUID] = set()
+        for line in self.session.lines:
+            if line.id not in target_ids:
+                new_lines.append(line)
+                continue
+            pixels_to_remove = {
+                point
+                for point in line.points
+                if x0 <= point.x <= x1 and y0 <= point.y <= y1
+                and self._point_in_polygon(point, polygon_points)
+            }
+            if not pixels_to_remove:
+                new_lines.append(line)
+                continue
+            before_lines.append(copy.deepcopy(line))
+            removed_pixels += len(pixels_to_remove)
+            changed_count += 1
+            line.points.difference_update(pixels_to_remove)
+            if line.points:
+                new_lines.append(line)
+                after_lines.append(copy.deepcopy(line))
+            else:
+                removed_ids.add(line.id)
+
+        if changed_count == 0:
+            self.status_label.setText("Drawn erase area did not intersect the target event pixels.")
+            return
+
+        self.session.set_lines(new_lines)
+        self.session.visible_line_ids.difference_update(removed_ids)
+        self._push_lines_undo_state(before_lines, after_lines, visible_before, set(self.session.visible_line_ids))
+        if self.repository is not None:
+            self.repository.replace_all(self.session.lines)
+        self.refresh_lines()
+        self.status_label.setText(
+            f"Erased {removed_pixels:,} pixels from {changed_count:,} event(s) inside the drawn area."
+        )
 
     def split_disconnected_events(self, selected_ids: set[UUID]) -> None:
         if not self._image_is_loaded():
@@ -473,6 +871,9 @@ class MainWindow(QMainWindow):
             return
         new_lines: list[DicLine] = []
         replacement_ids: set[UUID] = set()
+        before_lines: list[DicLine] = []
+        after_lines: list[DicLine] = []
+        visible_before = set(self.session.visible_line_ids)
         split_event_count = 0
         created_count = 0
         for line in self.session.lines:
@@ -483,21 +884,23 @@ class MainWindow(QMainWindow):
             if len(components) <= 1:
                 new_lines.append(line)
                 continue
+            before_lines.append(copy.deepcopy(line))
             split_event_count += 1
             created_count += len(components)
             for component in components:
                 replacement = self._line_with_points(line, component, keep_id=False)
                 new_lines.append(replacement)
+                after_lines.append(copy.deepcopy(replacement))
                 replacement_ids.add(replacement.id)
 
         if split_event_count == 0:
             self.status_label.setText("Selected events are already single connected pieces.")
             return
 
-        self._push_undo_state()
         self.session.set_lines(new_lines)
         self.session.visible_line_ids.update(replacement_ids)
         self.session.visible_line_ids.difference_update(selected_ids - replacement_ids)
+        self._push_lines_undo_state(before_lines, after_lines, visible_before, set(self.session.visible_line_ids))
         if self.repository is not None:
             self.repository.replace_all(self.session.lines)
         self.refresh_lines()
@@ -533,6 +936,9 @@ class MainWindow(QMainWindow):
 
         new_lines: list[DicLine] = []
         replacement_ids: set[UUID] = set()
+        before_lines: list[DicLine] = []
+        after_lines: list[DicLine] = []
+        visible_before = set(self.session.visible_line_ids)
         changed_count = 0
         removed_pixels = 0
         created_count = 0
@@ -544,20 +950,22 @@ class MainWindow(QMainWindow):
             if removed == 0:
                 new_lines.append(line)
                 continue
+            before_lines.append(copy.deepcopy(line))
             changed_count += 1
             removed_pixels += removed
             created_count += len(replacements)
             new_lines.extend(replacements)
+            after_lines.extend(copy.deepcopy(replacement) for replacement in replacements)
             replacement_ids.update(replacement.id for replacement in replacements)
 
         if changed_count == 0:
             self.status_label.setText("Boundary cut did not intersect the selected events.")
             return
 
-        self._push_undo_state()
         self.session.set_lines(new_lines)
         self.session.visible_line_ids.update(replacement_ids)
         self.session.visible_line_ids.difference_update(selected_ids - replacement_ids)
+        self._push_lines_undo_state(before_lines, after_lines, visible_before, set(self.session.visible_line_ids))
         if self.repository is not None:
             self.repository.replace_all(self.session.lines)
         self.refresh_lines()
@@ -568,6 +976,36 @@ class MainWindow(QMainWindow):
             f"Boundary cut updated {changed_count} event(s), removed {removed_pixels:,} boundary pixels, "
             f"and produced {created_count} event segment(s)."
         )
+
+    def begin_manual_brush_edit(self) -> None:
+        if self._manual_brush_edit_active:
+            return
+        self._manual_brush_edit_active = True
+        self._manual_brush_changed = False
+        self._manual_brush_original_line = None
+        self._manual_brush_visible_before = set(self.session.visible_line_ids)
+
+    def finish_manual_brush_edit(self) -> None:
+        if not self._manual_brush_edit_active:
+            return
+        if self._manual_brush_changed and self._manual_brush_original_line is not None:
+            after_line = self.session.line_by_id(self._manual_brush_original_line.id)
+            self._push_line_undo_state(
+                self._manual_brush_original_line,
+                copy.deepcopy(after_line) if after_line is not None else None,
+                self._manual_brush_visible_before or set(),
+                set(self.session.visible_line_ids),
+            )
+            if self.repository is not None:
+                if after_line is None:
+                    self.repository.delete_lines({self._manual_brush_original_line.id})
+                else:
+                    self.repository.save_new_lines([after_line])
+        self._manual_brush_edit_active = False
+        self._manual_brush_changed = False
+        self._manual_brush_original_line = None
+        self._manual_brush_visible_before = None
+        self.refresh_lines()
 
     def edit_selected_event_pixels(self, mode: str, center: Point, radius: int) -> None:
         line = self._manual_edit_target_line(center, radius)
@@ -586,25 +1024,40 @@ class MainWindow(QMainWindow):
         if mode == "add":
             if brush_points.issubset(line.points):
                 return
-            self._push_undo_state()
+            if not self._manual_brush_edit_active:
+                self._push_undo_state()
+            else:
+                self._capture_manual_brush_original_line(line)
             line.points.update(brush_points)
         elif mode == "erase":
             if not (line.points & brush_points):
                 return
-            self._push_undo_state()
+            if not self._manual_brush_edit_active:
+                self._push_undo_state()
+            else:
+                self._capture_manual_brush_original_line(line)
             line.points.difference_update(brush_points)
+            self._manual_brush_changed = True
             if not line.points:
                 self.session.delete_lines({line.id})
-                if self.repository is not None:
+                if self.repository is not None and not self._manual_brush_edit_active:
                     self.repository.delete_lines({line.id})
                 self.refresh_lines()
                 self.status_label.setText("Erased the selected event completely.")
                 return
-        if self.repository is not None:
+        self._manual_brush_changed = True
+        if self.repository is not None and not self._manual_brush_edit_active:
             self.repository.save_new_lines([line])
-        self.refresh_lines()
+        if self._manual_brush_edit_active:
+            self.canvas.set_live_edit_line(line)
+        else:
+            self.canvas.set_lines(self.session.lines, self.session.visible_line_ids)
         action = "Added" if mode == "add" else "Erased"
         self.status_label.setText(f"{action} pixels for event {line.id}; event now has {line.size:,} pixels.")
+
+    def _capture_manual_brush_original_line(self, line: DicLine) -> None:
+        if self._manual_brush_original_line is None:
+            self._manual_brush_original_line = copy.deepcopy(line)
 
     def _manual_edit_target_line(self, center: Point, radius: int) -> DicLine | None:
         selected_ids = self.line_list.selected_line_ids()
@@ -618,6 +1071,27 @@ class MainWindow(QMainWindow):
             if line.id in search_ids and is_point_in_line(center, line, max(3.0, float(radius))):
                 return line
         return None
+
+    @staticmethod
+    def _point_in_polygon(point: Point, polygon: list[Point]) -> bool:
+        inside = False
+        x = float(point.x)
+        y = float(point.y)
+        count = len(polygon)
+        j = count - 1
+        for i in range(count):
+            xi, yi = float(polygon[i].x), float(polygon[i].y)
+            xj, yj = float(polygon[j].x), float(polygon[j].y)
+            intersects = (yi > y) != (yj > y)
+            if intersects:
+                denominator = yj - yi
+                if abs(denominator) < 1e-12:
+                    denominator = 1e-12
+                x_at_y = (xj - xi) * (y - yi) / denominator + xi
+                if x <= x_at_y:
+                    inside = not inside
+            j = i
+        return inside
 
     def update_preview(self, x: int, y: int) -> None:
         self.preview.update_preview(self.image_rgb, x, y)
@@ -664,20 +1138,67 @@ class MainWindow(QMainWindow):
         if not self._undo_stack:
             self.status_label.setText("Nothing to undo")
             return
-        self._redo_stack.append(self._snapshot_state())
-        self._restore_state(self._undo_stack.pop())
+        state = self._undo_stack.pop()
+        self._redo_stack.append(self._inverse_state_for_redo(state))
+        self._restore_state(state, use_before=True)
         self.status_label.setText("Undid last manual edit")
 
     def redo_manual_edit(self) -> None:
         if not self._redo_stack:
             self.status_label.setText("Nothing to redo")
             return
-        self._undo_stack.append(self._snapshot_state())
-        self._restore_state(self._redo_stack.pop())
+        state = self._redo_stack.pop()
+        self._undo_stack.append(self._inverse_state_for_redo(state))
+        self._restore_state(state, use_before=True)
         self.status_label.setText("Redid manual edit")
 
     def _push_undo_state(self) -> None:
         self._undo_stack.append(self._snapshot_state())
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._update_history_buttons()
+
+    def _push_line_undo_state(
+        self,
+        before_line: DicLine,
+        after_line: DicLine | None,
+        visible_before: set[UUID],
+        visible_after: set[UUID],
+    ) -> None:
+        self._undo_stack.append(
+            {
+                "kind": "line",
+                "line_id": before_line.id,
+                "before": copy.deepcopy(before_line),
+                "after": copy.deepcopy(after_line) if after_line is not None else None,
+                "visible_before": set(visible_before),
+                "visible_after": set(visible_after),
+            }
+        )
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._update_history_buttons()
+
+    def _push_lines_undo_state(
+        self,
+        before_lines: list[DicLine],
+        after_lines: list[DicLine],
+        visible_before: set[UUID],
+        visible_after: set[UUID],
+    ) -> None:
+        if not before_lines and not after_lines:
+            return
+        self._undo_stack.append(
+            {
+                "kind": "lines",
+                "before": copy.deepcopy(before_lines),
+                "after": copy.deepcopy(after_lines),
+                "visible_before": set(visible_before),
+                "visible_after": set(visible_after),
+            }
+        )
         if len(self._undo_stack) > self._max_history:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
@@ -688,16 +1209,84 @@ class MainWindow(QMainWindow):
             self._undo_stack.pop()
         self._update_history_buttons()
 
-    def _snapshot_state(self) -> tuple[list[DicLine], set[UUID]]:
-        return copy.deepcopy(self.session.lines), set(self.session.visible_line_ids)
+    def _snapshot_state(self) -> dict[str, Any]:
+        return {
+            "kind": "full",
+            "lines": copy.deepcopy(self.session.lines),
+            "visible_ids": set(self.session.visible_line_ids),
+        }
 
-    def _restore_state(self, state: tuple[list[DicLine], set[UUID]]) -> None:
-        lines, visible_ids = state
-        self.session.set_lines(copy.deepcopy(lines))
-        self.session.visible_line_ids = set(visible_ids)
+    def _restore_state(self, state: Any, use_before: bool = True) -> None:
+        if isinstance(state, tuple):
+            lines, visible_ids = state
+            self.session.set_lines(copy.deepcopy(lines))
+            self.session.visible_line_ids = set(visible_ids)
+        elif isinstance(state, dict) and state.get("kind") == "full":
+            self.session.set_lines(copy.deepcopy(state["lines"]))
+            self.session.visible_line_ids = set(state["visible_ids"])
+        elif isinstance(state, dict) and state.get("kind") == "line":
+            line = state["before"] if use_before else state["after"]
+            visible_ids = state["visible_before"] if use_before else state["visible_after"]
+            self._restore_single_line_state(state["line_id"], line, visible_ids)
+        elif isinstance(state, dict) and state.get("kind") == "lines":
+            lines = state["before"] if use_before else state["after"]
+            remove_lines = state["after"] if use_before else state["before"]
+            visible_ids = state["visible_before"] if use_before else state["visible_after"]
+            self._restore_many_lines_state(lines, remove_lines, visible_ids)
+        else:
+            return
         if self.repository is not None:
             self.repository.replace_all(self.session.lines)
         self.refresh_lines()
+
+    def _restore_single_line_state(self, line_id: UUID, line: DicLine | None, visible_ids: set[UUID]) -> None:
+        replacement = copy.deepcopy(line) if line is not None else None
+        lines = [existing for existing in self.session.lines if existing.id != line_id]
+        if replacement is not None:
+            lines.append(replacement)
+        self.session.set_lines(lines)
+        self.session.visible_line_ids = set(visible_ids)
+
+    def _restore_many_lines_state(
+        self,
+        lines_to_restore: list[DicLine],
+        lines_to_remove: list[DicLine],
+        visible_ids: set[UUID],
+    ) -> None:
+        remove_ids = {line.id for line in lines_to_remove}
+        restore_ids = {line.id for line in lines_to_restore}
+        lines = [
+            existing
+            for existing in self.session.lines
+            if existing.id not in remove_ids and existing.id not in restore_ids
+        ]
+        lines.extend(copy.deepcopy(lines_to_restore))
+        self.session.set_lines(lines)
+        self.session.visible_line_ids = set(visible_ids)
+
+    def _inverse_state_for_redo(self, state: Any) -> Any:
+        if isinstance(state, tuple):
+            return self._snapshot_state()
+        if isinstance(state, dict) and state.get("kind") == "full":
+            return self._snapshot_state()
+        if isinstance(state, dict) and state.get("kind") == "line":
+            return {
+                "kind": "line",
+                "line_id": state["line_id"],
+                "before": copy.deepcopy(state.get("after")),
+                "after": copy.deepcopy(state.get("before")),
+                "visible_before": set(state.get("visible_after", set())),
+                "visible_after": set(state.get("visible_before", set())),
+            }
+        if isinstance(state, dict) and state.get("kind") == "lines":
+            return {
+                "kind": "lines",
+                "before": copy.deepcopy(state.get("after", [])),
+                "after": copy.deepcopy(state.get("before", [])),
+                "visible_before": set(state.get("visible_after", set())),
+                "visible_after": set(state.get("visible_before", set())),
+            }
+        return self._snapshot_state()
 
     def _clear_history(self) -> None:
         self._undo_stack.clear()
@@ -727,7 +1316,10 @@ class MainWindow(QMainWindow):
         if text.startswith("Add"):
             self.canvas.set_edit_mode("add")
         elif text.startswith("Erase"):
-            self.canvas.set_edit_mode("erase")
+            if text.startswith("Erase drawn area"):
+                self.canvas.set_edit_mode("area_erase")
+            else:
+                self.canvas.set_edit_mode("erase")
         else:
             self.canvas.set_edit_mode("select")
 

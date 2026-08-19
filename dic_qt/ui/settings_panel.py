@@ -22,8 +22,11 @@ class DetectionSettings:
 class SettingsPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.choose_file_button = QPushButton("Choose File")
+        self.load_progress_button = QPushButton("Load Progress")
+        self.save_progress_button = QPushButton("Save Progress")
         self.reset_button = QPushButton("Reset settings")
+        self.load_progress_button.setToolTip("Resume a saved Manual Review checkpoint, including project file paths and edited events.")
+        self.save_progress_button.setToolTip("Save the current Manual Review state so it can be resumed later.")
 
         self.intensity_tolerance = QSpinBox()
         self.intensity_tolerance.setRange(0, 255)
@@ -45,7 +48,8 @@ class SettingsPanel(QWidget):
         form.addRow("Minimum intensity", self.min_intensity)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.choose_file_button)
+        layout.addWidget(self.load_progress_button)
+        layout.addWidget(self.save_progress_button)
         layout.addLayout(form)
         layout.addWidget(self.reset_button)
         layout.addStretch(1)

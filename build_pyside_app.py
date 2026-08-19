@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
+from pathlib import Path
 
 
 def main() -> int:
+    root = Path(__file__).resolve().parent
+    miller_dir = root / "hcp_slip_twin_miller_indices"
     command = [
         sys.executable,
         "-m",
@@ -22,6 +26,8 @@ def main() -> int:
         "skimage",
         "--collect-data",
         "scipy",
+        "--add-data",
+        f"{miller_dir}{os.pathsep}hcp_slip_twin_miller_indices",
         "dic_qt_launcher.py",
     ]
     return subprocess.call(command)

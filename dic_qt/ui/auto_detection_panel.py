@@ -138,6 +138,74 @@ def downsample_rgb_for_view(
     return np.asarray(pil_image).copy()
 
 
+def overlay_processing_stage_on_raw(raw_rgb: np.ndarray, stage_image: np.ndarray) -> np.ndarray:
+    base = display_image(raw_rgb).astype(np.float32, copy=False) / 255.0
+    stage = np.squeeze(np.asarray(stage_image))
+    if stage.ndim == 3:
+        stage = stage[..., 0]
+    if stage.dtype == bool:
+        alpha = stage.astype(np.float32) * 0.65
+    else:
+        values = np.nan_to_num(stage.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+        lo = float(values.min()) if values.size else 0.0
+        hi = float(values.max()) if values.size else 0.0
+        if hi <= lo:
+            alpha = np.zeros(values.shape, dtype=np.float32)
+        else:
+            alpha = np.clip((values - lo) / (hi - lo), 0.0, 1.0).astype(np.float32) * 0.65
+    if alpha.shape != base.shape[:2]:
+        alpha = np.zeros(base.shape[:2], dtype=np.float32)
+    color = np.zeros_like(base)
+    color[..., 0] = 1.0
+    color[..., 1] = 0.05
+    color[..., 2] = 0.0
+    out = base * (1.0 - alpha[..., None]) + color * alpha[..., None]
+    return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def connected_component_preview(mask: np.ndarray, raw_rgb: np.ndarray | None = None) -> tuple[np.ndarray, int]:
+    from skimage import measure
+
+    mask_bool = np.asarray(mask, dtype=bool)
+    labels = measure.label(mask_bool, connectivity=2)
+    component_count = int(labels.max())
+    if raw_rgb is None:
+        base = np.zeros((*mask_bool.shape, 3), dtype=np.float32)
+        alpha = np.where(mask_bool, 1.0, 0.0).astype(np.float32)
+    else:
+        base = display_image(raw_rgb).astype(np.float32, copy=False) / 255.0
+        alpha = np.where(mask_bool, 0.72, 0.0).astype(np.float32)
+    label_values = labels.astype(np.uint32, copy=False)
+    colors = np.zeros((*mask_bool.shape, 3), dtype=np.float32)
+    colors[..., 0] = ((label_values * 73) % 255) / 255.0
+    colors[..., 1] = ((label_values * 151 + 53) % 255) / 255.0
+    colors[..., 2] = ((label_values * 211 + 101) % 255) / 255.0
+    colors[labels == 0] = 0.0
+    out = base * (1.0 - alpha[..., None]) + colors * alpha[..., None]
+    return (np.clip(out, 0.0, 1.0) * 255).astype(np.uint8), component_count
+
+
+def connected_component_count(mask: np.ndarray) -> int:
+    from skimage import measure
+
+    return int(measure.label(np.asarray(mask, dtype=bool), connectivity=2).max())
+
+
+def downsample_stage_for_preview(image: np.ndarray, max_dim: int = MAX_OVERLAY_PREVIEW_DIM) -> np.ndarray:
+    arr = np.asarray(image)
+    if max(arr.shape[:2]) <= max_dim:
+        return arr
+    resample = Image.Resampling.NEAREST if arr.dtype == bool else Image.Resampling.BILINEAR
+    if arr.dtype == bool:
+        pil_image = Image.fromarray(arr.astype(np.uint8) * 255)
+        pil_image.thumbnail((max_dim, max_dim), resample)
+        return np.asarray(pil_image) > 0
+    display = display_image(arr)
+    pil_image = Image.fromarray(display)
+    pil_image.thumbnail((max_dim, max_dim), resample)
+    return np.asarray(pil_image).copy()
+
+
 def sanitize_display_range(value: tuple[float, float], raw_min: float, raw_max: float) -> tuple[float, float]:
     display_min, display_max = value
     display_min = max(raw_min, min(float(display_min), raw_max))
@@ -248,15 +316,25 @@ def run_preprocessing_preview(params: AutoPipelineParams) -> dict:
         if params.use_skeletonize
         else detection_mask
     )
+    candidate_clean_component_count = connected_component_count(candidate_clean)
     return {
         "params": params,
         "crop": crop,
+        "preview_is_full_resolution": False,
         "enhanced": enhanced,
         "ridges": ridges,
         "candidate_mask": candidate_mask,
         "candidate_clean": candidate_clean,
+        "candidate_clean_component_count": candidate_clean_component_count,
         "display_mask": display_mask,
     }
+
+
+def run_preprocessing_full_resolution_preview(params: AutoPipelineParams) -> dict:
+    result = run_preprocessing(params)
+    result["preview_is_full_resolution"] = True
+    result["candidate_clean_component_count"] = connected_component_count(result["candidate_clean"])
+    return result
 
 
 @contextmanager
@@ -980,6 +1058,27 @@ class AutoDetectionPanel(QWidget):
         auto_process_button.clicked.connect(self._auto_process_common_steps)
         control_layout.addWidget(auto_process_button)
 
+        self.display_view_mode = QComboBox()
+        self.display_view_mode.addItem("Current Step", "current")
+        self.display_view_mode.addItem("Raw Selected Image", "raw")
+        self.display_view_mode.addItem("Overlay Step On Raw", "overlay")
+        self.display_view_mode.setToolTip(
+            "Choose whether the preview shows only the selected processing step, "
+            "the raw selected image, or the selected step overlaid in red on the raw image."
+        )
+        control_layout.addWidget(QLabel("Preview Mode"))
+        control_layout.addWidget(self.display_view_mode)
+
+        self.preview_resolution_mode = QComboBox()
+        self.preview_resolution_mode.addItem("Fast Preview", "fast")
+        self.preview_resolution_mode.addItem("Full Resolution", "full")
+        self.preview_resolution_mode.setToolTip(
+            "Fast Preview processes a downsampled image for responsive tuning. "
+            "Full Resolution processes the exact selected image, so Clean / Close components match Mask Detection, but it can be slow."
+        )
+        control_layout.addWidget(QLabel("Processing Resolution"))
+        control_layout.addWidget(self.preview_resolution_mode)
+
         self.option_stack = QStackedWidget()
         self.option_stack.setMinimumHeight(280)
         self.option_stack.setToolTip("Parameters for the selected common processing step.")
@@ -1040,8 +1139,10 @@ class AutoDetectionPanel(QWidget):
 
         self.preprocess_stats = QLabel("No preprocessing result yet.")
         self.preprocess_stats.setWordWrap(True)
-        self.preprocess_stats.setToolTip("Reserved preprocessing status area. Detailed pixel counts are hidden to keep the interface compact.")
-        self.preprocess_stats.hide()
+        self.preprocess_stats.setToolTip(
+            "Preview count from the displayed preprocessing image. If the selected region is downsampled, "
+            "the full-resolution detection count can still differ."
+        )
         control_layout.addWidget(self.preprocess_stats)
         control_layout.addStretch(1)
 
@@ -1051,6 +1152,8 @@ class AutoDetectionPanel(QWidget):
         layout.addWidget(controls)
         layout.addWidget(self.display_preview, 1)
 
+        self.display_view_mode.currentIndexChanged.connect(lambda _index: self._show_display_stage())
+        self.preview_resolution_mode.currentIndexChanged.connect(lambda _index: self._refresh_display())
         self.clahe_clip.valueChanged.connect(self._clahe_spin_changed)
         self.clahe_clip_slider.valueChanged.connect(self._clahe_slider_changed)
         for widget in (
@@ -1519,12 +1622,19 @@ class AutoDetectionPanel(QWidget):
     def _run_preprocessing(self) -> None:
         with busy_cursor():
             try:
-                self._preprocess_preview = run_preprocessing_preview(self._params())
+                if self._use_full_resolution_preview():
+                    self._set_status_neutral("Processing full-resolution Common Steps preview...")
+                    QApplication.processEvents()
+                    self._preprocess_preview = run_preprocessing_full_resolution_preview(self._params())
+                    self._preprocess = self._preprocess_preview
+                else:
+                    self._preprocess_preview = run_preprocessing_preview(self._params())
+                    self._preprocess = None
             except Exception as exc:  # pragma: no cover - UI safety path
                 self._set_status_error(f"Preprocessing failed: {exc}")
                 return
-        self._set_status_neutral("Preprocessing preview updated.")
-        self._preprocess = None
+        mode_text = "full-resolution" if self._use_full_resolution_preview() else "fast"
+        self._set_status_neutral(f"Preprocessing preview updated ({mode_text}).")
         self._hough = None
         self._mask = None
         self._trace = None
@@ -2196,24 +2306,77 @@ class AutoDetectionPanel(QWidget):
             return
         self._run_preprocessing()
 
+    def _use_full_resolution_preview(self) -> bool:
+        if not hasattr(self, "preview_resolution_mode"):
+            return False
+        return str(self.preview_resolution_mode.currentData() or "fast") == "full"
+
     def _show_display_stage(self) -> None:
-        if self._display_stage == "original":
+        raw_rgb = None
+        if self._preprocess_preview is not None:
+            raw_rgb = self._preprocess_preview["crop"]["display_rgb"]
+        else:
             try:
                 preview_region = load_downsampled_processing_region(self._params())
             except Exception:
-                self.display_preview.set_array(None)
-            else:
-                self.display_preview.set_array(preview_region["display_rgb"])
+                preview_region = None
+            if preview_region is not None:
+                raw_rgb = preview_region["display_rgb"]
+
+        view_mode = "current"
+        if hasattr(self, "display_view_mode"):
+            view_mode = str(self.display_view_mode.currentData() or "current")
+
+        self._update_preprocess_component_stats()
+        raw_preview = downsample_stage_for_preview(raw_rgb) if raw_rgb is not None else None
+        if self._display_stage == "original" or view_mode == "raw":
+            self.display_preview.set_array(raw_preview)
             return
         if self._preprocess_preview is None:
             self.display_preview.set_array(None)
             return
+        stage_image = None
         if self._display_stage == "clahe":
-            self.display_preview.set_array(self._preprocess_preview["enhanced"])
+            stage_image = self._preprocess_preview["enhanced"]
         elif self._display_stage == "ridge":
-            self.display_preview.set_array(self._preprocess_preview["candidate_mask"])
+            stage_image = self._preprocess_preview["candidate_mask"]
         elif self._display_stage == "clean":
-            self.display_preview.set_array(self._preprocess_preview["candidate_clean"])
+            stage_image = self._preprocess_preview["candidate_clean"]
+        if stage_image is None:
+            self.display_preview.set_array(raw_preview)
+        elif self._display_stage == "clean" and view_mode == "current":
+            stage_preview = downsample_stage_for_preview(stage_image)
+            self.display_preview.set_array(connected_component_preview(stage_preview)[0])
+        elif self._display_stage == "clean" and view_mode == "overlay" and raw_preview is not None:
+            stage_preview = downsample_stage_for_preview(stage_image)
+            self.display_preview.set_array(connected_component_preview(stage_preview, raw_preview)[0])
+        elif view_mode == "overlay" and raw_preview is not None:
+            stage_preview = downsample_stage_for_preview(stage_image)
+            self.display_preview.set_array(overlay_processing_stage_on_raw(raw_preview, stage_preview))
+        else:
+            self.display_preview.set_array(downsample_stage_for_preview(stage_image))
+
+    def _update_preprocess_component_stats(self) -> None:
+        if not hasattr(self, "preprocess_stats"):
+            return
+        if self._preprocess_preview is None:
+            self.preprocess_stats.setText("No preprocessing result yet.")
+            return
+        preview_scale = float(self._preprocess_preview["crop"].get("preview_scale", 1.0))
+        if "candidate_clean_component_count" in self._preprocess_preview:
+            component_count = int(self._preprocess_preview["candidate_clean_component_count"])
+        else:
+            component_count = connected_component_count(self._preprocess_preview["candidate_clean"])
+        is_full_resolution = bool(self._preprocess_preview.get("preview_is_full_resolution", False))
+        if is_full_resolution:
+            note = "Full-resolution mode: this component count matches Mask Detection for the same parameters."
+        elif preview_scale > 1.01:
+            note = "Fast preview is downsampled; switch to Full Resolution before final Mask Detection."
+        else:
+            note = "Fast preview is already using the selected region without downsampling."
+        self.preprocess_stats.setText(
+            f"Clean / Close preview components: {component_count:,}\n{note}"
+        )
 
     @staticmethod
     def _spin(minimum: int, maximum: int, step: int, value: int) -> QSpinBox:

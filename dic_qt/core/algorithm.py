@@ -250,9 +250,11 @@ def cut_selected_lines(
 
 def is_point_in_line(point: Point, line: DicLine, tolerance: float = 3.0) -> bool:
     tt = tolerance * tolerance
-    for p in line.points:
-        if (point.x - p.x) ** 2 + (point.y - p.y) ** 2 < tt:
-            return True
+    radius = max(1, int(np.ceil(tolerance)))
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx * dx + dy * dy < tt and Point(point.x + dx, point.y + dy) in line.points:
+                return True
     return False
 
 
