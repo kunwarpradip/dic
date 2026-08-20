@@ -34,7 +34,7 @@ python build_pyside_app.py
 
 This creates a dist folder which contains the executable and all the dependencies required for the run. 
 
-########### Debugging and Playground as Streamlit #############
+## Debugging and Playground as Streamlit 
 
 3.1. If you want to test it in a debugging way: Start the Streamlit app from the repository root:
 
@@ -44,7 +44,7 @@ streamlit run tests/streamlit_seed_method_compare.py
 
 3.2. Open the local URL shown in the terminal, usually:
 
-It gives you localhost address and port to launch the streamlit app in the browser.
+It gives you localhost address and port to launch the streamlit app in the browser. For example:
 ```text
 http://localhost:8501
 ```
