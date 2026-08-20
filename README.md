@@ -34,7 +34,7 @@ python build_pyside_app.py
 
 This creates a dist folder which contains the executable and all the dependencies required for the run. 
 
-## Debugging and Playground as Streamlit 
+## Streamlit as Debugging and Playground App
 
 3.1. If you want to test it in a debugging way: Start the Streamlit app from the repository root:
 
