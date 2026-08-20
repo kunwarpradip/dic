@@ -60,23 +60,19 @@ The DIC Event App is designed to detect and analyze deformation events in digita
 \end{enumerate}
 
 \section{Starting The App}
-
+\subsection{Using the Code Base}
 From the repository root, activate the conda environment and run:
 
 \begin{verbatim}
-conda activate dicqt
-python -m dic_qt.app
+1. git clone "https://github.com/kunwarpradip/dic.git"
+2. cd path\to\dic
+3. conda env create -f dic_qt\environment.yml
+4. conda activate dicqt
+5. python -m dic_qt.app
 \end{verbatim}
 
-The main window contains these top-level tabs:
-
-\begin{itemize}
-    \item \ui{Project Files}
-    \item \ui{Auto Detection}
-    \item \ui{Manual Review}
-    \item \ui{Classification}
-    \item \ui{Alignment}
-\end{itemize}
+\subsection{Using the Executable Files}
+You can directly launch the .exe file for Windows, and application file for macOS. 
 
 \section{General Image Navigation}
 
@@ -159,7 +155,7 @@ The \ui{Auto Detection} tab contains the main automatic event extraction workflo
 
 \subsection{Purpose}
 
-The \ui{Crop} tab selects the region used by later processing. You can process the full image or a rectangular crop.
+The \ui{Crop} tab selects the region used by later processing. You can process the full image or a rectangular crop. This feature lets user to first play around the smaller crop - which is faster and easier to understand the parameters required for that particular image that is being processed. Once the working parameters are figured out for the image, then it is recommended to process with the full image. 
 
 \subsection{Features}
 
@@ -499,7 +495,7 @@ Manual Review can be a long process, so the app supports checkpoints.
 
 \begin{enumerate}
     \item Click \ui{Save Progress}.
-    \item The app saves edited events, event pixels, visible IDs, settings, and project file paths.
+    \item The app saves edited events, event pixels, visible IDs, settings, and project file paths. The progress should be saved with extension " *.dicreview".
     \item Later, click \ui{Load Progress} to resume from the saved checkpoint.
 \end{enumerate}
 
@@ -509,7 +505,7 @@ Manual Review can be a long process, so the app supports checkpoints.
 
 \subsection{Purpose}
 
-Classification scores the currently reviewed events against crystallographic trace vectors generated in \ui{Auto Detection > Alignment}.
+Classification scores the currently reviewed events against crystallographic trace vectors generated in \ui{Auto Detection}.
 
 \subsection{Parameters}
 
@@ -538,7 +534,7 @@ For each reviewed event:
 
 \subsection{Score Meaning}
 
-The score is an angle-based agreement score. A higher score means the event direction is closer to one of the selected crystallographic trace vectors.
+The score is an angle-based agreement score (1 - (Difference in angle between event and trace vector)/(Tolerance Angle)). A higher score means the event direction is closer to one of the selected crystallographic trace vectors.
 
 \subsection{Outputs}
 
@@ -567,16 +563,6 @@ The top-level \ui{Alignment} tab is used to align an EBSD image to a DIC image u
     \item Click \ui{Save Transformation} to save control points and polynomial coefficients.
 \end{enumerate}
 
-\subsection{Control Points}
-
-Good control points include:
-
-\begin{itemize}
-    \item Grain triple points.
-    \item Twin tips.
-    \item Twin-twin contacts.
-    \item Twin-grain-boundary contacts.
-\end{itemize}
 
 \subsection{Point Appearance}
 
@@ -601,7 +587,7 @@ The saved transformation output includes:
 
 \begin{enumerate}
     \item Open \ui{Project Files} and load all available project paths.
-    \item Go to \ui{Auto Detection > Crop} and select a crop for parameter tuning.
+    \item Go to \ui{Auto Detection $>$ Crop} and select a crop for parameter tuning.
     \item Go to \ui{Common Steps} and tune preprocessing until the candidate mask is visually faithful.
     \item Run \ui{Mask Detection} first for band-like events, or \ui{Hough Detection} for strongly line-like events.
     \item Run \ui{Boundary Cuts} using the EBSD boundary image.

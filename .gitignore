@@ -18,6 +18,8 @@ check_traces.py
 /bcc
 *.pdf
 build
-dist
+dist_mac_version1.0
 DIC_Event_App.spec
 *.dicreview*
+test_data
+test_files.zip

@@ -18,39 +18,36 @@ conda env create -f dic_qt/environment.yml
 conda activate dicqt
 ```
 
-<!-- 3. Make sure the required data folders are present in the project root:
+3. At the root folder:
 
-```text
-z_share_DIC_data_for_hv_mvu_pk/
-z_share_EBSD_DIC_alignment_data/
-z_share_EBSD_data_for_hv_mvu_pk/
-hcp_slip_twin_miller_indices/
+```bash
+python -m dic_qt.app
 ```
 
-Large `.tif`, `.ang`, and output `.csv` files may be provided separately through Git LFS or a shared drive. Keep them in the same folder paths expected by the app. -->
+This runs the software. 
 
-3. Start the Streamlit app from the repository root:
+4. To create an executable build (Use mac for macOS build and Windows machine for WindowsOS build - both follow the same process of building)
+```bash
+pip install pyinstaller
+python build_pyside_app.py
+```
+
+This creates a dist folder which contains the executable and all the dependencies required for the run. 
+
+########### Debugging and Playground as Streamlit #############
+
+3.1. If you want to test it in a debugging way: Start the Streamlit app from the repository root:
 
 ```bash
 streamlit run tests/streamlit_seed_method_compare.py
 ```
 
-4. Open the local URL shown in the terminal, usually:
+3.2. Open the local URL shown in the terminal, usually:
 
+It gives you localhost address and port to launch the streamlit app in the browser.
 ```text
 http://localhost:8501
 ```
 
-## Notes
 
-- The first tab, `Crystal Setup`, controls which crystal structure and slip/twin trace modes are used during alignment scoring.
-- HCP pyramidal and twin modes require the CSV files inside `hcp_slip_twin_miller_indices/`.
-- If the app cannot find a default image or CSV, use the file upload/path controls inside the relevant tab.
 
-## Runnning Alignment Tool
-
-1. At the root folder:
-
-```bash
-python -m dic_qt.app
-```
