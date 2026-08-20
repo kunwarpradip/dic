@@ -1,0 +1,680 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue
+}
+
+\setlist[itemize]{leftmargin=1.3em}
+\setlist[enumerate]{leftmargin=1.5em}
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.75em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.75em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.75em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{DIC Event App}
+\rhead{User Guide}
+\cfoot{\thepage}
+
+\newcommand{\ui}[1]{\textbf{#1}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\note}[1]{\vspace{0.3em}\noindent\textcolor{blue!70!black}{\textbf{Note:}} #1\vspace{0.3em}}
+\newcommand{\warn}[1]{\vspace{0.3em}\noindent\textcolor{red!70!black}{\textbf{Warning:}} #1\vspace{0.3em}}
+
+\title{\textbf{DIC Event App User Guide}\\
+\large Step-by-step workflow for event detection, review, EBSD boundary cutting, and crystallographic classification}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose Of The Software}
+
+The DIC Event App is designed to detect and analyze deformation events in digital image correlation (DIC) maps. The main workflow is:
+
+\begin{enumerate}
+    \item Load project files such as BLN, GRX, EBSD boundary, ANG, and alignment transformation files.
+    \item Select a full image or crop region for event detection.
+    \item Tune common preprocessing steps.
+    \item Detect events using either mask-based detection or Hough-seed-based detection.
+    \item Cut events where they cross EBSD grain boundaries.
+    \item Analyze event shapes and send selected event types to Manual Review.
+    \item Manually edit, split, merge, erase, or add event pixels.
+    \item Classify reviewed events using crystallographic slip/twin trace vectors.
+    \item Save final event-level and pixel-level CSV outputs.
+\end{enumerate}
+
+\section{Starting The App}
+
+From the repository root, activate the conda environment and run:
+
+\begin{verbatim}
+conda activate dicqt
+python -m dic_qt.app
+\end{verbatim}
+
+The main window contains these top-level tabs:
+
+\begin{itemize}
+    \item \ui{Project Files}
+    \item \ui{Auto Detection}
+    \item \ui{Manual Review}
+    \item \ui{Classification}
+    \item \ui{Alignment}
+\end{itemize}
+
+\section{General Image Navigation}
+
+Most image panels support the same navigation controls.
+
+\begin{longtable}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Action} & \textbf{Behavior} \\
+\midrule
+Mouse wheel & Zoom in or out around the cursor. \\
+\code{+} or \code{=} & Zoom in. \\
+\code{-} & Zoom out. \\
+\code{0} & Fit image to the current view. \\
+Hold \code{Space} and drag & Temporarily pan the image with the hand tool. \\
+Hover over event pixels & Highlight the event under the cursor in Manual Review. \\
+\bottomrule
+\end{longtable}
+
+\note{If keyboard zoom or space-drag does not respond, move the mouse over the image area first so the image panel has focus.}
+
+\section{Project Files Tab}
+
+\subsection{Purpose}
+
+The \ui{Project Files} tab is the central place to define the files used by the rest of the app. Auto Detection, Boundary Cuts, Alignment analysis, and Manual Review all read from these paths.
+
+\subsection{Files}
+
+\begin{longtable}{p{0.24\linewidth}p{0.18\linewidth}p{0.48\linewidth}}
+\toprule
+\textbf{File} & \textbf{Required?} & \textbf{Use} \\
+\midrule
+BLN image & Required & Main DIC displacement map used for detection and display. \\
+GRX image & Optional & Local strain map, useful for visual inspection and overlays. \\
+EBSD aligned image & Optional & EBSD orientation image already aligned to DIC coordinates. \\
+EBSD boundary image & Required for boundary cuts & Black/dark boundary map used to cut events at grain boundaries. \\
+ANG file & Required for classification & Contains EBSD coordinates and Euler angles. \\
+Transformation JSON & Required for ANG/DIC alignment & Contains transformation parameters used to map EBSD coordinates into DIC coordinates. \\
+\bottomrule
+\end{longtable}
+
+\subsection{How To Use}
+
+\begin{enumerate}
+    \item Click \ui{Browse} next to each file type.
+    \item Confirm the summary table shows expected dimensions and file status.
+    \item Click \ui{Set Current Paths As Defaults} if this project should be reused often.
+    \item Use \ui{Load Analysis Defaults} later to reload the saved paths.
+\end{enumerate}
+
+\subsection{Example}
+
+For a Ti cryo analysis, the BLN image may be a file such as:
+
+\begin{verbatim}
+Fused_BlN_step3.tif
+\end{verbatim}
+
+The EBSD boundary image may be:
+
+\begin{verbatim}
+Aligned_EBSD_Boundary.tif
+\end{verbatim}
+
+\warn{The app uses the file dimensions to decide whether overlays are spatially meaningful. If the BLN and boundary images do not match the same coordinate frame, boundary cuts will be wrong even if the app runs successfully.}
+
+\section{Auto Detection Tab}
+
+The \ui{Auto Detection} tab contains the main automatic event extraction workflow. Its sub-tabs are:
+
+\begin{itemize}
+    \item \ui{Crop}
+    \item \ui{Common Steps}
+    \item \ui{Detection}
+    \item \ui{Boundary Cuts}
+    \item \ui{Alignment}
+\end{itemize}
+
+\section{Auto Detection: Crop}
+
+\subsection{Purpose}
+
+The \ui{Crop} tab selects the region used by later processing. You can process the full image or a rectangular crop.
+
+\subsection{Features}
+
+\begin{longtable}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Feature} & \textbf{Description} \\
+\midrule
+Original dimension & Shows the full BLN image size in pixels. \\
+Use full image & Processes the complete BLN image. This is slower but produces full-field results. \\
+Crop selector & Drag on the image to define a rectangular crop. Crop coordinates are stored in original image coordinates. \\
+Crop X and Y & Top-left coordinate of the crop. These are usually set by dragging on the image. \\
+Crop width and height & Crop size in pixels. These can be edited after selecting a crop. \\
+Brightness/contrast display & Lets the user visually inspect BLN values more clearly while selecting the crop. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Example}
+
+If the original image is \code{10588 x 5986} and the selected crop is:
+
+\begin{verbatim}
+x = 2500, y = 1200, width = 3000, height = 3000
+\end{verbatim}
+
+then all later detection results from that run are interpreted in global DIC image coordinates, not local crop coordinates.
+
+\section{Auto Detection: Common Steps}
+
+\subsection{Purpose}
+
+\ui{Common Steps} creates the processed mask used by both detection algorithms. This tab should be tuned carefully because the detection result should reflect the mask shown here.
+
+\subsection{Workflow}
+
+\begin{enumerate}
+    \item Click \ui{Auto Process Common Steps}.
+    \item Inspect the image after each stage.
+    \item Use the stage buttons to expose only the parameters for that stage.
+    \item Adjust parameters until the clean/closed mask visually represents candidate event bands.
+\end{enumerate}
+
+\subsection{Stages}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+\textbf{Stage} & \textbf{What It Does} & \textbf{Main Parameters} \\
+\midrule
+Brightness / Contrast & Maps raw BLN float values into a display/process range. & Brightness, contrast. \\
+CLAHE & Improves local contrast without using one global contrast stretch. & CLAHE clip limit. \\
+Threshold & Enhances ridge-like structures and thresholds candidate pixels. & Ridge sigma max, ridge percentile, Otsu multiplier. \\
+Clean / Close & Removes small objects and bridges small gaps. & Minimum object pixels, closing radius. \\
+\bottomrule
+\end{longtable}
+
+\subsection{View Modes}
+
+\begin{longtable}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Mode} & \textbf{Use} \\
+\midrule
+Current Step & Shows the processed image for the selected step. \\
+Raw Selected Image & Shows the selected crop/full image before preprocessing. \\
+Overlay Step On Raw & Overlays the current processed result on the raw selected image. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Preview Resolution}
+
+\begin{itemize}
+    \item \ui{Fast Preview} down-samples display images so sliders respond faster.
+    \item \ui{Full Resolution} processes the selected region at full resolution. Use this when finalizing parameters.
+\end{itemize}
+
+\note{CLAHE can be slower than other steps because it computes local contrast over many image tiles. Full-resolution CLAHE on a large BLN image can take noticeably longer than crop processing.}
+
+\section{Auto Detection: Detection}
+
+The \ui{Detection} tab supports two algorithms:
+
+\begin{itemize}
+    \item \ui{Mask Detection}
+    \item \ui{Hough Detection}
+\end{itemize}
+
+\subsection{Mask Detection}
+
+\subsubsection{Purpose}
+
+Mask Detection treats the final clean/closed mask from \ui{Common Steps} as the event source. Connected mask components become events directly.
+
+\subsubsection{Algorithm}
+
+\begin{enumerate}
+    \item Use the selected crop or full image.
+    \item Run the same common preprocessing stages.
+    \item Use the clean/closed binary mask.
+    \item Label connected components in the mask.
+    \item Remove components smaller than the minimum pixel threshold.
+    \item Convert each remaining component into one event.
+\end{enumerate}
+
+\subsubsection{Output}
+
+Mask Detection creates:
+
+\begin{itemize}
+    \item Event-level table: one row per detected event.
+    \item Event-pixel table: one row per event pixel.
+    \item Overlay preview: red pixels show detected mask events.
+\end{itemize}
+
+\subsection{Hough Detection}
+
+\subsubsection{Purpose}
+
+Hough Detection is useful when events are line-like. It first finds Hough line segments, selects seed pixels from those line segments, and then grows events from those seeds.
+
+\subsubsection{Step 1: Detect Hough Lines And Seeds}
+
+\begin{longtable}{p{0.3\linewidth}p{0.6\linewidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} \\
+\midrule
+Hough threshold & Minimum voting strength for accepting a line segment. Higher values keep fewer, stronger lines. \\
+Line length & Minimum accepted Hough line length in pixels. \\
+Line gap & Maximum gap that may be bridged while forming a Hough line. \\
+Seed spacing & Minimum spacing between selected seeds. \\
+Use all Hough seeds & Uses all candidate seeds after spacing. \\
+Maximum seeds & Caps seed count when \ui{Use all Hough seeds} is off. \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{Step 2: Fill Events From Hough Seeds}
+
+\begin{longtable}{p{0.3\linewidth}p{0.6\linewidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} \\
+\midrule
+Intensity tolerance & Allowed intensity drop while growing from a seed. \\
+Best-fit-line tolerance & How far growing pixels may deviate from the fitted line. \\
+Minimum intensity & Minimum blue-channel intensity accepted during growth. \\
+Minimum points & Rejects grown events smaller than this size. \\
+Duplicate overlap & Merges events when they share enough pixels. \\
+Merge distance & Merges nearby compatible fragments. \\
+Merge angle & Maximum angle difference for distance-based merging. \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{Optimization}
+
+During Hough filling, seeds inside already accepted events are skipped. This prevents many redundant seeds from growing the same event repeatedly.
+
+\section{Auto Detection: Boundary Cuts}
+
+\subsection{Purpose}
+
+Boundary Cuts split detected events wherever they cross EBSD grain boundaries.
+
+\subsection{Inputs}
+
+\begin{itemize}
+    \item Detected events from Mask Detection or Hough Detection.
+    \item EBSD boundary image from \ui{Project Files}.
+\end{itemize}
+
+\subsection{Parameters}
+
+\begin{longtable}{p{0.3\linewidth}p{0.6\linewidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} \\
+\midrule
+Event source & Choose Mask events or Hough filled events. \\
+Black threshold & Boundary image pixels darker than this normalized value are treated as boundary pixels. \\
+Boundary dilation & Expands boundary pixels before cutting. Larger values cut more aggressively. \\
+Minimum segment pixels & Discards cut fragments smaller than this many pixels. \\
+Connectivity & Controls whether pixels are connected by edges only or by edges and corners. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Overlay Colors}
+
+\begin{longtable}{p{0.25\linewidth}p{0.65\linewidth}}
+\toprule
+\textbf{Color} & \textbf{Meaning} \\
+\midrule
+Red & Event pixels kept after cutting. \\
+Blue & EBSD boundary pixels. \\
+Green & Event pixels removed by the boundary cut. \\
+\bottomrule
+\end{longtable}
+
+\section{Auto Detection: Alignment Analysis}
+
+This sub-tab prepares crystallographic information used later by \ui{Classification}. It is separate from the control-point alignment tab.
+
+\subsection{Crystal Setup}
+
+\subsubsection{Purpose}
+
+The \ui{Crystal Setup} step defines which crystal system and slip/twin modes are expected to be active.
+
+\subsubsection{Options}
+
+\begin{longtable}{p{0.26\linewidth}p{0.64\linewidth}}
+\toprule
+\textbf{Option} & \textbf{Meaning} \\
+\midrule
+Crystal structure & Choose BCC, HCP, or FCC. \\
+EBSD reference frame & Choose EDAX or Oxford convention. \\
+Lattice parameter \code{a} & HCP lattice parameter used by pyramidal and twin calculations. \\
+Lattice parameter \code{c} & HCP lattice parameter used by pyramidal and twin calculations. \\
+Slip tolerance & Angle tolerance for slip modes. \\
+Twin tolerance & Angle tolerance for twin modes. \\
+Active modes & Checked modes are used during scoring. Their order defines preference. \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{Priority Rule}
+
+The order of active modes matters. If multiple traces are within tolerance, the app follows the selected priority order, with special handling for slip/twin conflicts according to the scoring logic.
+
+\subsection{ANG / Transform}
+
+\subsubsection{Purpose}
+
+This step reads:
+
+\begin{itemize}
+    \item \code{XSTEP} and \code{YSTEP} from the ANG header.
+    \item Euler angles and coordinate columns from ANG core data.
+    \item Transformation parameters from the transformation JSON file.
+\end{itemize}
+
+The app transforms EBSD/ANG coordinates into DIC coordinate space while keeping Euler angles unchanged.
+
+\subsection{Trace Vectors}
+
+\subsubsection{Purpose}
+
+Trace vectors are calculated from Euler angles and the active crystal modes. These vectors represent possible slip or twin plane traces at each transformed ANG point.
+
+\subsubsection{Example}
+
+For an HCP setup with Basal and Prismatic selected:
+
+\begin{itemize}
+    \item Basal contributes 1 trace vector.
+    \item Prismatic contributes 3 trace vectors.
+    \item Each ANG point has 4 candidate trace directions.
+\end{itemize}
+
+\subsection{Event Shapes}
+
+\subsubsection{Purpose}
+
+Event shape analysis groups boundary-cut events into categories before Manual Review.
+
+\begin{longtable}{p{0.25\linewidth}p{0.65\linewidth}}
+\toprule
+\textbf{Shape Type} & \textbf{Meaning} \\
+\midrule
+Linear & Event is line-like based on PCA/SVD line fit and aspect ratio. \\
+Irregular & Event is not clearly linear or blob-like but still may be meaningful. \\
+Blob-like & Event is dense and compact rather than line-like. \\
+Fragmented & Event has multiple disconnected components. \\
+Small noise & Event is below the minimum pixel threshold. \\
+\bottomrule
+\end{longtable}
+
+\subsubsection{Send To Manual Review}
+
+The user can choose which event types are sent to Manual Review. By default, linear and irregular events are the main review candidates.
+
+\section{Manual Review Tab}
+
+\subsection{Purpose}
+
+Manual Review allows the user to inspect and edit event masks after automatic detection and boundary cutting.
+
+\subsection{Event Lists}
+
+Events are grouped by type, such as:
+
+\begin{itemize}
+    \item Linear
+    \item Irregular
+    \item Manual
+\end{itemize}
+
+Within each tab, events are sorted by pixel count in descending order.
+
+\subsection{Checkboxes And Selection}
+
+\begin{longtable}{p{0.28\linewidth}p{0.62\linewidth}}
+\toprule
+\textbf{Action} & \textbf{Meaning} \\
+\midrule
+Check event box & Show that event in the red overlay. \\
+Uncheck event box & Hide that event from the red overlay. The event can still be selected by hover/click. \\
+Click event row & Select the event in the list. \\
+Hover image event & Temporarily highlight the event under the cursor. \\
+\ui{Locate Selected} & Blink and center one selected event when it is hard to find. \\
+\ui{Select All} & Show all loaded events in the overlay. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Manual Tools}
+
+\begin{longtable}{p{0.3\linewidth}p{0.6\linewidth}}
+\toprule
+\textbf{Tool} & \textbf{Use} \\
+\midrule
+Select events & Select events by clicking pixels in the image or rows in the event list. \\
+Add pixels & Add pixels to the selected event using the brush. \\
+Erase pixels & Erase pixels from the selected event using the brush. \\
+Erase drawn area & Draw a freehand polygon and remove event pixels inside it. The polygon is teal/cyan. \\
+Draw cut line & Draw a line across an event to split it into daughter events. \\
+Grow by seed & Click a seed point to grow a new event using the manual seed-growing algorithm. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Boundary Tools}
+
+\begin{longtable}{p{0.3\linewidth}p{0.6\linewidth}}
+\toprule
+\textbf{Tool} & \textbf{Use} \\
+\midrule
+Show Boundary & Overlay the EBSD boundary image from Project Files. \\
+Cut By Boundary & Cut selected or checked events wherever they intersect boundary pixels. \\
+Split Disconnected Pieces & If an edit leaves one event as separate islands, split those islands into separate events. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Saving And Resuming}
+
+Manual Review can be a long process, so the app supports checkpoints.
+
+\begin{enumerate}
+    \item Click \ui{Save Progress}.
+    \item The app saves edited events, event pixels, visible IDs, settings, and project file paths.
+    \item Later, click \ui{Load Progress} to resume from the saved checkpoint.
+\end{enumerate}
+
+\note{The old manual image \ui{Choose File} button has been removed. Manual Review should be populated from auto-detection results or resumed from saved progress.}
+
+\section{Classification Tab}
+
+\subsection{Purpose}
+
+Classification scores the currently reviewed events against crystallographic trace vectors generated in \ui{Auto Detection > Alignment}.
+
+\subsection{Parameters}
+
+\begin{longtable}{p{0.32\linewidth}p{0.58\linewidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} \\
+\midrule
+Max center lookup distance & Maximum allowed distance from the event center to the nearest transformed ANG point. \\
+Minimum linearity & Minimum line-likeness required before the event can be considered likely real. Set to 0 to rely only on trace-angle matching. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Scoring Logic}
+
+For each reviewed event:
+
+\begin{enumerate}
+    \item The event pixels are fit with a best-fit line using PCA/SVD.
+    \item The line direction is converted to Cartesian convention: \(+x\) right and \(+y\) up.
+    \item The event center is calculated.
+    \item The nearest transformed ANG point is found.
+    \item Slip/twin trace vectors from that ANG point are compared with the event direction.
+    \item If a selected trace is within its tolerance, the event is classified as \ui{likely real}.
+    \item Otherwise, it is classified as \ui{likely noise}.
+\end{enumerate}
+
+\subsection{Score Meaning}
+
+The score is an angle-based agreement score. A higher score means the event direction is closer to one of the selected crystallographic trace vectors.
+
+\subsection{Outputs}
+
+Click \ui{Save Classified CSVs} to save:
+
+\begin{itemize}
+    \item Event-level CSV with class, score, angle errors, center coordinates, best mode, and trace information.
+    \item Pixel-level CSV with event pixels and classification metadata.
+\end{itemize}
+
+\section{Alignment Tab: Control-Point EBSD/DIC Alignment}
+
+\subsection{Purpose}
+
+The top-level \ui{Alignment} tab is used to align an EBSD image to a DIC image using paired control points.
+
+\subsection{Workflow}
+
+\begin{enumerate}
+    \item Click \ui{Load DIC file}.
+    \item Click \ui{Load EBSD file}.
+    \item Use \ui{Toggle DIC/EBSD} to switch between images.
+    \item Add matching control points on each image.
+    \item Use \ui{Load Control Points} to paste existing point lists.
+    \item Click \ui{Run Alignment} to generate the aligned EBSD image.
+    \item Click \ui{Save Transformation} to save control points and polynomial coefficients.
+\end{enumerate}
+
+\subsection{Control Points}
+
+Good control points include:
+
+\begin{itemize}
+    \item Grain triple points.
+    \item Twin tips.
+    \item Twin-twin contacts.
+    \item Twin-grain-boundary contacts.
+\end{itemize}
+
+\subsection{Point Appearance}
+
+\begin{itemize}
+    \item DIC points are red with a white border.
+    \item EBSD points are black with a white border.
+    \item Points from the inactive image may be shown as reference points but should not be editable from the wrong image view.
+\end{itemize}
+
+\subsection{Saved Transformation}
+
+The saved transformation output includes:
+
+\begin{itemize}
+    \item Moving EBSD control points.
+    \item Fixed DIC control points.
+    \item Polynomial coefficients for transformed \(x\) and \(y\).
+    \item Fit quality information such as RMSE where available.
+\end{itemize}
+
+\section{Recommended End-To-End Workflow}
+
+\begin{enumerate}
+    \item Open \ui{Project Files} and load all available project paths.
+    \item Go to \ui{Auto Detection > Crop} and select a crop for parameter tuning.
+    \item Go to \ui{Common Steps} and tune preprocessing until the candidate mask is visually faithful.
+    \item Run \ui{Mask Detection} first for band-like events, or \ui{Hough Detection} for strongly line-like events.
+    \item Run \ui{Boundary Cuts} using the EBSD boundary image.
+    \item In \ui{Alignment > Crystal Setup}, select crystal structure, EBSD convention, tolerances, and active modes.
+    \item Load ANG/transform summary and generate trace vectors.
+    \item Analyze event shapes.
+    \item Send linear and irregular events to \ui{Manual Review}.
+    \item Manually edit events, split disconnected pieces, and save progress regularly.
+    \item Run \ui{Classification}.
+    \item Save classified CSV outputs.
+\end{enumerate}
+
+\section{Troubleshooting}
+
+\begin{longtable}{p{0.34\linewidth}p{0.56\linewidth}}
+\toprule
+\textbf{Problem} & \textbf{Likely Cause And Fix} \\
+\midrule
+No image appears in Auto Detection & Load a BLN image in Project Files. \\
+Boundary cut produces zero cuts & Check that the boundary image is aligned to DIC coordinates and the black threshold is appropriate. \\
+Boundary looks discontinuous when zoomed in & The boundary map may contain gaps or antialiasing. Try a slightly larger boundary dilation. \\
+Mask Detection detects more components than expected & Use Full Resolution in Common Steps and confirm the final clean/closed mask. \\
+Hough filling is slow & Too many redundant seeds may be present. Increase seed spacing, reduce max seeds, or use Mask Detection for band-like structures. \\
+Manual Review hover cannot find events & Ensure events are loaded in Manual Review. Hidden events can still be selected, but the image and event coordinates must match. \\
+Small selected event is hard to find & Select the event row and click \ui{Locate Selected}. \\
+Classification fails because ANG is missing & Load ANG and transformation JSON in Project Files, then run ANG/Transform and Trace Vectors. \\
+Many events classified as noise & Check crystal setup, active mode priority, angle tolerance, transformed ANG coverage, and event direction convention. \\
+\bottomrule
+\end{longtable}
+
+\section{CSV Output Overview}
+
+\subsection{Event-Level CSV}
+
+The event-level CSV usually contains one row per event. Depending on the stage, it may include:
+
+\begin{itemize}
+    \item \code{event_id}
+    \item \code{num_pixels}
+    \item bounding box coordinates
+    \item event shape type
+    \item classification result
+    \item score
+    \item best matching mode and trace
+    \item event center
+    \item best-fit-line angle
+\end{itemize}
+
+\subsection{Event-Pixel CSV}
+
+The event-pixel CSV contains one row per pixel and usually includes:
+
+\begin{itemize}
+    \item \code{event_id}
+    \item \code{pixel_x}
+    \item \code{pixel_y}
+    \item optional source event ID
+    \item optional shape/classification metadata
+\end{itemize}
+
+\warn{Pixel CSV files can become large for full-resolution images. Save them in project-specific output folders and keep file names descriptive.}
+
+\section{Best Practices}
+
+\begin{itemize}
+    \item Tune parameters on a crop before processing the full image.
+    \item Use Full Resolution mode before final detection if preview mode was used for speed.
+    \item Prefer Mask Detection for finite-width band-like events.
+    \item Use Hough Detection when events are thin and line-like.
+    \item Use EBSD boundary cuts before manual review when grain boundaries are important.
+    \item Save Manual Review progress often.
+    \item Review linear and irregular events before final classification.
+    \item Check classification overlays and saved CSVs before drawing scientific conclusions.
+\end{itemize}
+
+\end{document}
