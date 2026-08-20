@@ -16,7 +16,7 @@ check_traces.py
 .dic_qt_auto_parameter_defaults.json
 .dic_qt_alignment_parameter_defaults.json
 /bcc
-*.pdf
+1-s2.0-S1359645426003654-main.pdf
 build
 dist_mac_version1.0
 DIC_Event_App.spec
