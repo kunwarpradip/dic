@@ -1,4 +1,4 @@
-# DIC Event Detection Streamlit App
+# DIC Event Detection App
 
 This repository contains a Streamlit workflow for DIC event detection, EBSD boundary cuts, and EBSD/DIC trace-alignment analysis.
 
